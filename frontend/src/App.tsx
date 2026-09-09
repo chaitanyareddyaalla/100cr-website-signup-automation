@@ -7,6 +7,7 @@ import {
   getWorkers,
   updateBatch,
   getExportUrl,
+  API_URL,
   type Batch,
   type Readiness,
   type WorkerInfo,
@@ -62,7 +63,6 @@ function App() {
 
     let reconnectTimeout: number | null = null
     let isActive = true
-    const apiUrl = import.meta.env.VITE_API_URL ?? import.meta.env.VITE_APP_URL ?? 'http://127.0.0.1:8000'
 
     function connectToEvents() {
       if (!isActive) return
@@ -72,11 +72,11 @@ function App() {
         .then((b) => { if (isActive) setBatch(b) })
         .catch(() => {})
 
-      const events = new EventSource(`${apiUrl}/batches/${batchId}/events`)
+      const events = new EventSource(`${API_URL}/batches/${batchId}/events`)
 
       function fetchAccounts() {
         if (!isActive) return
-        fetch(`${apiUrl}/batches/${batchId}/accounts?limit=50`)
+        fetch(`${API_URL}/batches/${batchId}/accounts?limit=50`)
           .then((res) => res.json())
           .then((data) => {
             if (isActive && data?.accounts) {
