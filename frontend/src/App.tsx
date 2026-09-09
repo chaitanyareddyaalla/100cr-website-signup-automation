@@ -68,7 +68,7 @@ function App() {
       if (!isActive) return
 
       // Refetch latest batch state immediately on reconnect/connect
-      getBatch(batchId)
+      getBatch(batchId!)
         .then((b) => { if (isActive) setBatch(b) })
         .catch(() => {})
 
