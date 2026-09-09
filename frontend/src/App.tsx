@@ -343,22 +343,50 @@ function App() {
                   <div className="exports-section">
                     <span className="exports-label">Export Batch Data:</span>
                     <div className="export-btns">
-                      <a
-                        href={getExportUrl(batch.id, 'csv')}
-                        download
+                      <button
+                        type="button"
                         className="btn-secondary"
-                        style={{ textDecoration: 'none', display: 'inline-block' }}
+                        onClick={async () => {
+                          try {
+                            const res = await fetch(getExportUrl(batch.id, 'csv'))
+                            const blob = await res.blob()
+                            const url = window.URL.createObjectURL(blob)
+                            const a = document.createElement('a')
+                            a.href = url
+                            a.download = `batch_${batch.id.slice(0, 8)}_accounts.csv`
+                            document.body.appendChild(a)
+                            a.click()
+                            document.body.removeChild(a)
+                            window.URL.revokeObjectURL(url)
+                          } catch {
+                            window.open(getExportUrl(batch.id, 'csv'), '_blank')
+                          }
+                        }}
                       >
                         Download CSV
-                      </a>
-                      <a
-                        href={getExportUrl(batch.id, 'json')}
-                        download
+                      </button>
+                      <button
+                        type="button"
                         className="btn-secondary"
-                        style={{ textDecoration: 'none', display: 'inline-block' }}
+                        onClick={async () => {
+                          try {
+                            const res = await fetch(getExportUrl(batch.id, 'json'))
+                            const blob = await res.blob()
+                            const url = window.URL.createObjectURL(blob)
+                            const a = document.createElement('a')
+                            a.href = url
+                            a.download = `batch_${batch.id.slice(0, 8)}_accounts.json`
+                            document.body.appendChild(a)
+                            a.click()
+                            document.body.removeChild(a)
+                            window.URL.revokeObjectURL(url)
+                          } catch {
+                            window.open(getExportUrl(batch.id, 'json'), '_blank')
+                          }
+                        }}
                       >
                         Download JSON
-                      </a>
+                      </button>
                     </div>
                   </div>
 
