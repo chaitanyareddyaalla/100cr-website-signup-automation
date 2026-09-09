@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py312"
+exclude = [".venv", "frontend/node_modules", "data"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]

@@ -1,0 +1,1 @@
+"""Persistent batch model package."""

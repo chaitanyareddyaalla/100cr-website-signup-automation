@@ -1,0 +1,1078 @@
+TASK AUTOMATION — COMPLETE PRODUCTION ROADMAP
+Current architecture
+
+You already have a strong foundation:
+
+React Frontend
+       │
+       ▼
+FastAPI Backend
+       │
+       ├── Batch Management
+       ├── Worker Lifecycle
+       ├── Retry System
+       ├── Duplicate Handling
+       └── SSE Live Updates
+               │
+               ▼
+         Automation Adapter
+               │
+               ▼
+        Results + Database
+               │
+               ├── Google Sheets
+               └── PostgreSQL
+
+Your project is not starting from zero.
+
+🔴 PHASE 1 — CLEAN UP THE CURRENT PROJECT
+Task 1: Remove mock-only behavior
+
+Currently, the main issue is that the system can report simulated success.
+
+You need to identify every mock component.
+
+Check:
+run_mock_signup()
+mock_sheet.jsonl
+mock_data
+mock success
+fake result generators
+
+Create a clear configuration:
+
+APP_ENV=development
+
+AUTOMATION_MODE=mock
+
+For production:
+
+APP_ENV=production
+
+AUTOMATION_MODE=live
+
+The application should never accidentally run mock automation in production.
+
+Task 2: Create clear environments
+
+You need three environments.
+
+Development
+      ↓
+Staging
+      ↓
+Production
+Development
+APP_ENV=development
+AUTOMATION_MODE=mock
+Staging
+APP_ENV=staging
+AUTOMATION_MODE=live
+Production
+APP_ENV=production
+AUTOMATION_MODE=live
+🟢 PHASE 2 — REAL DATABASE
+Task 3: Move from SQLite to PostgreSQL
+
+Do not use SQLite for your deployed production system.
+
+Use:
+
+PostgreSQL
+
+Your production architecture should be:
+
+FastAPI
+   │
+   ▼
+PostgreSQL
+Task 4: Create proper database tables
+
+You should have at least:
+
+batches
+id
+referral
+target
+successful
+failed
+status
+created_at
+updated_at
+jobs
+id
+batch_id
+status
+attempts
+created_at
+updated_at
+identities
+
+For your authorized test identities:
+
+id
+test_identifier
+username
+status
+created_at
+used_at
+signup_results
+id
+batch_id
+identity_id
+status
+error_message
+attempts
+created_at
+events
+
+Optional but useful:
+
+id
+batch_id
+event_type
+payload
+created_at
+
+This helps debugging.
+
+Task 5: Database migrations
+
+Use:
+
+Alembic
+
+Never manually create production tables.
+
+Your workflow:
+
+Change model
+    ↓
+Create migration
+    ↓
+Test migration
+    ↓
+Deploy
+    ↓
+Run migration
+🟢 PHASE 3 — IDENTITY MANAGEMENT
+Task 6: Stop relying on temporary generated data
+
+Create a proper identity lifecycle.
+
+AVAILABLE
+    ↓
+RESERVED
+    ↓
+PROCESSING
+    ↓
+SUCCESS
+
+Or:
+
+PROCESSING
+    ↓
+FAILED
+
+Or:
+
+PROCESSING
+    ↓
+SKIPPED
+Task 7: Prevent duplicates at database level
+
+Do not rely only on Python code.
+
+Add database uniqueness.
+
+For example:
+
+UNIQUE(test_identifier)
+
+This protects you even when:
+
+Two workers run simultaneously
+The backend restarts
+A retry happens
+Two batches run at once
+Task 8: Identity reservation
+
+Before processing:
+
+Worker
+   │
+   ▼
+Find AVAILABLE identity
+   │
+   ▼
+Atomically reserve identity
+   │
+   ▼
+Process
+
+This prevents two workers from processing the same identity.
+
+🟢 PHASE 4 — REAL AUTOMATION ADAPTER
+Task 9: Keep automation separate
+
+Do not put Playwright code directly inside:
+
+main.py
+
+Your structure should remain:
+
+worker/
+    automation/
+        browser_manager.py
+        signup_flow.py
+
+    integrations/
+        signup_adapter.py
+
+Recommended:
+
+AutomationAdapter
+       │
+       ├── MockAdapter
+       │
+       └── LiveAdapter
+Task 10: Use deterministic automation
+
+For your own authorized website, configure selectors.
+
+Example:
+
+SIGNUP_URL=https://your-site.example/signup
+
+USERNAME_SELECTOR=#username
+
+PASSWORD_SELECTOR=#password
+
+SUBMIT_SELECTOR=#submit
+
+Avoid generic automation such as:
+
+Find any button containing "Submit"
+
+Use exact known selectors.
+
+Task 11: Define success correctly
+
+Do not say success just because:
+
+Page loaded
+
+or:
+
+URL changed
+
+or:
+
+Page contains "Welcome"
+
+Instead, define a deterministic success condition for your own site.
+
+For example:
+
+Account created successfully
+
+or verify through your application's own API/database.
+
+Task 12: Define duplicate behavior
+
+You specifically requested this:
+
+If the account already exists, skip it and continue.
+
+Your logic should be:
+
+Try identity
+      │
+      ▼
+Already exists?
+      │
+   YES ─────────► SKIPPED
+                      │
+                      ▼
+               Get next identity
+
+   NO
+      │
+      ▼
+Continue workflow
+
+A skipped identity should:
+
+Not count as success
+Not count as failure
+Be recorded
+Continue processing
+🟢 PHASE 5 — WORKER SYSTEM
+Task 13: Separate API and worker
+
+Currently, don't depend on:
+
+FastAPI process
+       │
+       └── Background Thread
+
+For production:
+
+                ┌──────────────┐
+                │   Frontend   │
+                └──────┬───────┘
+                       │
+                       ▼
+                ┌──────────────┐
+                │   FastAPI    │
+                │ API Service  │
+                └──────┬───────┘
+                       │
+                       ▼
+                 ┌─────────────┐
+                 │ PostgreSQL  │
+                 └─────────────┘
+                       ▲
+                       │
+                ┌──────┴───────┐
+                │    Worker    │
+                └──────────────┘
+🟢 PHASE 6 — QUEUE
+Task 14: Add Redis
+
+Use:
+
+Redis
+
+Architecture:
+
+API
+ │
+ ▼
+Queue
+ │
+ ▼
+Worker
+
+You can use:
+
+Redis
+
+with a Python queue framework.
+
+Possible choices:
+
+Celery
+RQ
+Arq
+Dramatiq
+
+For your project, I would recommend evaluating RQ or Dramatiq for simplicity.
+
+Task 15: Persistent jobs
+
+When you create:
+
+Batch
+
+The backend should create jobs.
+
+Batch
+   │
+   ├── Job 1
+   ├── Job 2
+   ├── Job 3
+   └── Job N
+
+Workers claim jobs safely.
+
+🟢 PHASE 7 — RETRY SYSTEM
+
+You already started this.
+
+Improve it.
+
+Each failure should be classified:
+
+TRANSIENT
+PERMANENT
+DUPLICATE
+UNKNOWN
+Task 16: Retry transient failures
+
+Example:
+
+Attempt 1
+    ↓
+Failure
+    ↓
+Wait
+    ↓
+Attempt 2
+    ↓
+Failure
+    ↓
+Wait
+    ↓
+Attempt 3
+
+After maximum retries:
+
+FAILED
+Task 17: Exponential backoff
+
+Use:
+
+Retry 1 → 2 seconds
+
+Retry 2 → 5 seconds
+
+Retry 3 → 15 seconds
+
+Do not immediately retry continuously.
+
+🟢 PHASE 8 — BATCH MANAGEMENT
+
+You already have much of this.
+
+Your final lifecycle:
+
+CREATED
+   │
+   ▼
+QUEUED
+   │
+   ▼
+RUNNING
+   │
+   ├────────► PAUSED
+   │              │
+   │              ▼
+   │           RUNNING
+   │
+   ├────────► STOPPED
+   │
+   ▼
+COMPLETED
+Task 18: Add batch statistics
+
+Show:
+
+Target:       1000
+Processed:    600
+Successful:   550
+Failed:       30
+Skipped:      20
+Remaining:    400
+
+Do not only show:
+
+successful
+failed
+🟢 PHASE 9 — LIVE FRONTEND
+
+You already have SSE.
+
+Keep it.
+
+Your frontend should show:
+
+Batch Status
+RUNNING 🟢
+
+Progress:
+
+██████████░░░░░░
+
+600 / 1000
+
+Statistics:
+
+Success: 550
+Failed: 30
+Skipped: 20
+Task 19: SSE reconnect
+
+You mentioned this was implemented.
+
+Verify:
+
+Browser disconnect
+       ↓
+Reconnect
+       ↓
+Receive current status
+
+Don't depend entirely on old events.
+
+When reconnecting, fetch the current batch state.
+
+🟢 PHASE 10 — GOOGLE SHEETS
+Task 20: Configure real Google Sheets
+
+This is one of your immediate next tasks.
+
+You need:
+
+Google Cloud Project
+Google Sheets API
+Service Account
+Service Account JSON
+Google Sheet
+Share Sheet with service account email
+Suggested Sheet columns
+Batch ID
+Identity ID
+Test Identifier
+Referral
+Status
+Attempts
+Error
+Created At
+Completed At
+Task 21: Make Google Sheets optional
+
+Your automation must not fail if Google Sheets temporarily fails.
+
+Correct:
+
+Automation
+     │
+     ▼
+Database save
+     │
+     ├── Success
+     │
+     ▼
+Google Sheets export
+     │
+     ├── Success → Done
+     │
+     └── Failure → Retry export later
+
+The database should be the source of truth.
+
+Google Sheets is an export/reporting layer.
+
+🟢 PHASE 11 — EXPORT SYSTEM
+Task 22: Don't use only Google Sheets
+
+Keep:
+
+PostgreSQL
+
+as your main source.
+
+Then support:
+
+Google Sheets
+CSV
+JSON
+
+as exports.
+
+🟢 PHASE 12 — ERROR HANDLING
+Task 23: Structured errors
+
+Don't store:
+
+Something failed
+
+Instead:
+
+error_code
+error_message
+stack_trace
+timestamp
+
+Example:
+
+PLAYWRIGHT_TIMEOUT
+
+Timeout waiting for #submit
+
+2026-09-09 10:30:22
+🟢 PHASE 13 — LOGGING
+Task 24: Add production logging
+
+Use structured logs.
+
+Example:
+
+INFO Batch started
+
+INFO Job claimed
+
+INFO Automation started
+
+INFO Identity skipped
+
+ERROR Browser timeout
+
+Include:
+
+batch_id
+job_id
+timestamp
+worker_id
+🟢 PHASE 14 — HEALTH CHECKS
+Task 25: Health endpoint
+
+You should have:
+
+GET /health
+
+Response:
+
+{
+    "status": "healthy"
+}
+Task 26: Readiness endpoint
+
+Add:
+
+GET /ready
+
+Check:
+
+API
+PostgreSQL
+Redis
+Worker
+
+Example:
+
+{
+    "status": "ready",
+    "database": true,
+    "redis": true
+}
+Task 27: Worker heartbeat
+
+Every worker should periodically update:
+
+worker_id
+last_seen
+status
+
+Example:
+
+worker-1
+ONLINE
+2026-09-09 10:30
+🟢 PHASE 15 — SECURITY
+Task 28: Environment variables
+
+Never commit:
+
+.env
+service-account.json
+passwords
+API keys
+cookies
+auth_state.json
+
+Your .gitignore should include:
+
+.env
+
+*.json
+
+!package.json
+
+auth_state.json
+
+browser_data/
+
+service-account.json
+
+__pycache__/
+
+.venv/
+
+node_modules/
+
+Be careful with *.json—you may need application JSON files in Git. Prefer explicit secrets.
+
+Task 29: Backend authentication
+
+Your API should not be publicly open.
+
+Add authentication for:
+
+Create Batch
+Start
+Pause
+Resume
+Stop
+Delete
+Task 30: CORS
+
+Do not use:
+
+allow_origins=["*"]
+
+in production.
+
+Specify your frontend domain.
+
+🟢 PHASE 16 — TESTING
+
+You currently have approximately:
+
+34 tests passing
+
+That's good.
+
+But add more.
+
+Task 31: Unit tests
+
+Test:
+
+Batch transitions
+Duplicate detection
+Retry logic
+Failure handling
+Statistics
+Identity reservation
+Google Sheets export
+Task 32: Integration tests
+
+Test:
+
+Frontend
+    ↓
+API
+    ↓
+PostgreSQL
+    ↓
+Queue
+    ↓
+Worker
+Task 33: Automation tests
+
+For your authorized demo website:
+
+Open site
+Fill form
+Submit
+Verify success
+Verify duplicate
+Verify failure
+🟢 PHASE 17 — DOCKER
+Task 34: Dockerize everything
+
+You should have:
+
+docker-compose.yml
+
+Architecture:
+
+Docker Compose
+
+├── frontend
+├── backend
+├── worker
+├── postgres
+└── redis
+
+Local development should be possible with:
+
+docker compose up --build
+🟢 PHASE 18 — DEPLOYMENT
+
+You mentioned Render.
+
+Your deployment should look like:
+
+                    Internet
+                       │
+                       ▼
+                 React Frontend
+                       │
+                       ▼
+                 FastAPI API
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+         PostgreSQL           Redis
+              ▲                 │
+              │                 ▼
+              └───────────── Worker
+🟢 PHASE 19 — RENDER SERVICES
+
+You will likely need:
+
+1️⃣ Frontend
+Static Site
+2️⃣ Backend
+Web Service
+3️⃣ Worker
+Background Worker
+4️⃣ PostgreSQL
+Render PostgreSQL
+5️⃣ Redis
+
+Use a managed Redis provider compatible with your hosting plan.
+
+🟢 PHASE 20 — PLAYWRIGHT DEPLOYMENT
+Task 35: Ensure browser dependencies exist
+
+Your Docker image must install:
+
+Python
+Playwright
+Chromium
+Browser dependencies
+
+Your Dockerfile needs a compatible setup.
+
+Test locally first:
+
+docker build .
+
+Then:
+
+docker run ...
+🟢 PHASE 21 — CONFIGURATION
+Task 36: Production environment variables
+
+Your backend should have variables similar to:
+
+APP_ENV=production
+
+DATABASE_URL=postgresql://...
+
+REDIS_URL=redis://...
+
+GOOGLE_SHEETS_ID=...
+
+GOOGLE_SHEETS_WORKSHEET=Results
+
+GOOGLE_SERVICE_ACCOUNT_JSON=...
+
+MAX_SIGNUP_RETRIES=3
+
+WORKER_CONCURRENCY=1
+
+For your own authorized automation target:
+
+AUTOMATION_MODE=live
+TARGET_URL=...
+🟢 PHASE 22 — BACKUPS
+Task 37: Database backups
+
+Configure regular backups.
+
+Your data should not exist only in:
+
+Google Sheets
+
+Database:
+
+PRIMARY
+
+Google Sheets:
+
+REPORTING / EXPORT
+🟢 PHASE 23 — MONITORING
+Task 38: Add monitoring
+
+Monitor:
+
+API uptime
+
+Worker uptime
+
+Database
+
+Queue size
+
+Failed jobs
+
+Batch failures
+
+Automation errors
+🟢 PHASE 24 — RATE LIMITING AND RESOURCE CONTROL
+Task 39: Protect your backend
+
+Add limits to:
+
+Create batch
+Start batch
+API requests
+
+Prevent accidental duplicate requests.
+
+🟢 PHASE 25 — RECOVERY
+Task 40: Handle server restart
+
+Imagine:
+
+Batch = RUNNING
+
+Server crashes
+
+When the system restarts:
+
+Find unfinished jobs
+        ↓
+Recover jobs
+        ↓
+Continue safely
+
+Do not lose:
+
+Processed count
+Success
+Failure
+Skipped
+🟢 PHASE 26 — ADMIN DASHBOARD
+Task 41: Add an admin view
+
+Show:
+
+ACTIVE BATCHES
+
+WORKERS
+
+QUEUE SIZE
+
+RECENT ERRORS
+
+DATABASE STATUS
+
+GOOGLE SHEETS STATUS
+🟢 PHASE 27 — FINAL PRODUCTION CHECKLIST
+
+Before deployment:
+
+Backend
+ No mock success functions in production
+ PostgreSQL configured
+ Database migrations work
+ API authentication exists
+ Error handling exists
+ Structured logging exists
+ Health endpoint works
+ Readiness endpoint works
+Worker
+ Worker runs separately
+ Jobs persist
+ Restart recovery works
+ Retry works
+ Duplicate handling works
+ Stop works
+ Pause works
+ Worker heartbeat works
+Automation
+ Deterministic selectors
+ Correct success verification
+ Correct failure detection
+ Screenshots/logs for failures
+ Browser cleanup works
+Database
+ PostgreSQL
+ Unique constraints
+ Indexes
+ Migrations
+ Backups
+Google Sheets
+ Google API enabled
+ Service Account configured
+ Sheet shared
+ Rows appear correctly
+ Export failure doesn't stop automation
+Frontend
+ API connected
+ SSE works
+ Reconnection works
+ Progress works
+ Error display works
+ Authentication works
+Deployment
+ Docker works locally
+ Environment variables configured
+ Secrets not committed
+ Backend deployed
+ Worker deployed
+ Database deployed
+ Frontend deployed
+🎯 THE ORDER I RECOMMEND
+
+Don't try to do all 41 tasks randomly.
+
+Do them in this order:
+🔥 STEP 1
+
+Clean the current mock/live separation.
+
+🔥 STEP 2
+
+Set up PostgreSQL locally.
+
+🔥 STEP 3
+
+Configure real Google Sheets.
+
+This is the first thing you can visibly test.
+
+Batch finishes
+      ↓
+PostgreSQL saves results
+      ↓
+Google Sheets receives rows
+🔥 STEP 4
+
+Implement persistent identity/job management.
+
+🔥 STEP 5
+
+Replace the embedded worker with a production worker architecture.
+
+🔥 STEP 6
+
+Add Redis/job queue if the workload requires it.
+
+🔥 STEP 7
+
+Connect the live automation adapter to your authorized site.
+
+🔥 STEP 8
+
+Test with a very small controlled batch.
+
+🔥 STEP 9
+
+Dockerize the entire application.
+
+🔥 STEP 10
+
+Deploy staging.
+
+🔥 STEP 11
+
+Test restart recovery.
+
+🔥 STEP 12
+
+Deploy production.
+
+🏆 My honest assessment
+
+Your project currently has a good backend foundation, especially compared with a simple loop-based automation project.
+
+Current state
+Architecture        ████████░░  8.5/10
+Backend Logic       ████████░░  8/10
+Testing             ███████░░░  7.5/10
+Frontend            ███████░░░  7/10
+Production Ready    ████░░░░░░  4/10
+Deployment Ready    ███░░░░░░░  3/10
+Data Persistence    █████░░░░░  5/10
+After completing the roadmap:
+Architecture        ██████████  10/10
+Reliability         █████████░  9/10
+Scalability         █████████░  9/10
+Production Ready    █████████░  9/10

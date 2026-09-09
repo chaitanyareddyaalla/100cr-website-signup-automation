@@ -1,0 +1,9 @@
+# Development dependencies (includes production dependencies)
+-r requirements.txt
+
+# Testing
+pytest==9.1.1
+httpx==0.28.1
+ruff==0.15.2
+black==26.3.1
+mypy==1.19.1

@@ -1,0 +1,64 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      AUTOMATION_MODE: ${AUTOMATION_MODE:-mock}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://task_automation:change-me-local-only@postgres:5432/task_automation}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      EMBEDDED_WORKER: "false"
+      FRONTEND_ORIGIN: http://localhost:5173
+      GOOGLE_SHEETS_ID: ${GOOGLE_SHEETS_ID:-}
+      GOOGLE_SHEETS_WORKSHEET: ${GOOGLE_SHEETS_WORKSHEET:-Results}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${GOOGLE_SERVICE_ACCOUNT_JSON:-}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - postgres
+      - redis
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      AUTOMATION_MODE: ${AUTOMATION_MODE:-mock}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://task_automation:change-me-local-only@postgres:5432/task_automation}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      WORKER_ID: worker-1
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - postgres
+      - redis
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: task_automation
+      POSTGRES_USER: task_automation
+      POSTGRES_PASSWORD: change-me-local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  postgres-data:
+  redis-data:

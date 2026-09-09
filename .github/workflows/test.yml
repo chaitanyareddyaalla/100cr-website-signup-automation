@@ -1,0 +1,146 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt -r requirements-dev.txt
+    
+    - name: Lint with ruff
+      run: |
+        pip install ruff
+        ruff check backend/ worker/ tests/ || true
+    
+    - name: Format check with black
+      run: |
+        pip install black
+        black --check backend/ worker/ tests/ || true
+    
+    - name: Type checking with mypy
+      run: |
+        pip install mypy
+        mypy backend/ || true
+    
+    - name: Run tests
+      env:
+        DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379
+      run: |
+        pytest tests/ -v --cov=backend --cov=worker --cov-report=xml
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.xml
+        flags: unittests
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Node
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install dependencies
+      working-directory: frontend
+      run: npm ci
+    
+    - name: Lint
+      working-directory: frontend
+      run: npm run lint || true
+    
+    - name: Build
+      working-directory: frontend
+      run: npm run build
+    
+    - name: Type check
+      working-directory: frontend
+      run: npx tsc --noEmit || true
+
+  docker-build:
+    needs: [test, frontend-test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Build backend image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./backend/Dockerfile
+        push: false
+        tags: signup-automation-backend:latest
+    
+    - name: Build worker image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./worker/Dockerfile
+        push: false
+        tags: signup-automation-worker:latest
+    
+    - name: Build frontend image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./frontend/Dockerfile
+        push: false
+        tags: signup-automation-frontend:latest

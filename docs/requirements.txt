@@ -1,0 +1,18 @@
+# Production dependencies
+
+# FastAPI & Web
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+pydantic-settings==2.1.0
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# Google Sheets
+gspread==6.2.1
+
+# Utilities
+python-dotenv==1.0.0

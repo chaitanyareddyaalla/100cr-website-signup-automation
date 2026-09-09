@@ -1,0 +1,11 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+frontend/node_modules
+frontend/dist
+.env
+.env.*
+!/.env.docker.example
+data/signup_automation.db
