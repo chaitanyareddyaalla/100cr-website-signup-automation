@@ -22,7 +22,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from worker.automation.signup_flow import run_mock_signup
-from worker.generators.test_data import generate_identity
+from worker.generators.test_data import (
+    generate_identity,
+    TestIdentity,
+    DEFAULT_STATIC_NAME,
+    DEFAULT_STATIC_PASSWORD,
+    DEFAULT_STATIC_PLACE,
+    DEFAULT_STATIC_LANGUAGE,
+)
+from worker.generators.phone_generator import generate_phone
 from worker.integrations.google_sheets import append_result
 from backend.app.api.auth import Role, require_role
 from backend.app.config import automation_mode, validate_automation_configuration
@@ -118,6 +126,7 @@ rate_limit_lock = threading.Lock()
 request_windows: dict[str, list[float]] = {}
 known_account_ids: set[str] = set()
 known_test_numbers: set[str] = set()
+global_used_phones: set[str] = set()
 
 
 def now() -> str:
@@ -192,6 +201,19 @@ def initialize_database() -> None:
                                 )
             except Exception as e:
                 logger.warning(f"Accounts backfill skipped: {e}")
+
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS used_phone_numbers ("
+            "phone TEXT PRIMARY KEY, batch_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        try:
+            connection.execute(
+                "INSERT OR IGNORE INTO used_phone_numbers (phone, batch_id, status, created_at) "
+                "SELECT DISTINCT phone, batch_id, status, created_at FROM accounts WHERE phone IS NOT NULL AND phone != ''"
+            )
+        except Exception as e:
+            logger.warning(f"used_phone_numbers backfill skipped: {e}")
+
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
         for name, definition in (
             ("skipped", "INTEGER NOT NULL DEFAULT 0"),
@@ -485,6 +507,75 @@ def finalize_identity(identifier: str, status: str, batch_id: str) -> None:
         connection.commit()
 
 
+def load_used_phones() -> None:
+    global global_used_phones
+    try:
+        with closing(connect()) as connection:
+            rows = connection.execute(
+                "SELECT phone FROM used_phone_numbers UNION SELECT phone FROM accounts"
+            ).fetchall()
+            for r in rows:
+                p = r["phone"]
+                if p:
+                    global_used_phones.add(p)
+        logger.info(f"Loaded {len(global_used_phones)} previously used phone numbers into memory (no-reuse guarantee)")
+    except Exception as e:
+        logger.warning(f"Could not load used phone numbers: {e}")
+
+
+def claim_unique_phone(batch_id: str) -> str:
+    """Atomically generate and reserve a brand-new, never-before-used phone number.
+
+    Guarantees no two batches, devices, or workers will EVER reuse or generate the same phone number.
+    """
+    with closing(connect()) as connection:
+        while True:
+            candidate = generate_phone()
+            if candidate in global_used_phones:
+                continue
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                exists = connection.execute(
+                    "SELECT 1 FROM used_phone_numbers WHERE phone = ?", (candidate,)
+                ).fetchone()
+                if exists:
+                    global_used_phones.add(candidate)
+                    connection.rollback()
+                    continue
+
+                exists_acc = connection.execute(
+                    "SELECT 1 FROM accounts WHERE phone = ?", (candidate,)
+                ).fetchone()
+                if exists_acc:
+                    global_used_phones.add(candidate)
+                    connection.rollback()
+                    continue
+
+                connection.execute(
+                    "INSERT INTO used_phone_numbers (phone, batch_id, status, created_at) VALUES (?, ?, 'RESERVED', ?)",
+                    (candidate, batch_id, now()),
+                )
+                connection.commit()
+                global_used_phones.add(candidate)
+                return candidate
+            except sqlite3.IntegrityError:
+                global_used_phones.add(candidate)
+                connection.rollback()
+                continue
+
+
+def mark_phone_status(phone: str, status: str) -> None:
+    try:
+        with closing(connect()) as connection:
+            connection.execute(
+                "UPDATE used_phone_numbers SET status = ? WHERE phone = ?",
+                (status, phone),
+            )
+            connection.commit()
+    except Exception as e:
+        logger.warning(f"Could not update status for phone {phone}: {e}")
+
+
 def seed_authorized_identities(identifiers: list[str]) -> int:
     """Seed test identities into the database with AVAILABLE status."""
     inserted = 0
@@ -619,18 +710,25 @@ def process_batch(batch_id: str) -> None:
                     account_id=available_ident,
                     test_id=available_ident,
                     phone=available_ident,
+                    name=DEFAULT_STATIC_NAME,
+                    password=DEFAULT_STATIC_PASSWORD,
+                    place=DEFAULT_STATIC_PLACE,
+                    language=DEFAULT_STATIC_LANGUAGE,
                     referral=batch.get("referral", ""),
                 )
             else:
-                try:
-                    identity = generate_identity(attempt, referral=batch.get("referral", ""))
-                except TypeError:
-                    identity = generate_identity(attempt)
+                unique_phone = claim_unique_phone(batch_id)
+                identity = TestIdentity(
+                    account_id=unique_phone,
+                    test_id=unique_phone,
+                    phone=unique_phone,
+                    name=DEFAULT_STATIC_NAME,
+                    password=DEFAULT_STATIC_PASSWORD,
+                    place=DEFAULT_STATIC_PLACE,
+                    language=DEFAULT_STATIC_LANGUAGE,
+                    referral=batch.get("referral", ""),
+                )
                 attempt += 1
-                if identity.account_id in known_account_ids or identity.test_id in known_test_numbers:
-                    continue
-                if not reserve_identity(identity.test_id, batch_id):
-                    continue
 
             current = get_batch(batch_id)
             if current["status"] != BatchStatus.RUNNING.value or stop_event.is_set():
@@ -656,6 +754,7 @@ def process_batch(batch_id: str) -> None:
                     connection.commit()
                 if result.status == "SUCCESS":
                     logger.info(f"Batch {batch_id}: Signup successful for {identity.account_id}")
+                    mark_phone_status(identity.phone, "SUCCESS")
                     recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
                     if recorded_batch is not None:
                         try:
@@ -696,6 +795,7 @@ def process_batch(batch_id: str) -> None:
                     break
                 if result.status == "DUPLICATE":
                     logger.info(f"Batch {batch_id}: Duplicate identity {identity.account_id} - skipped")
+                    mark_phone_status(identity.phone, "DUPLICATE")
                     current = get_batch(batch_id)
                     recorded_batch = update_batch(batch_id, skipped=current["skipped"] + 1, attempted=current["attempted"] + 1)
                     finalize_identity(identity.test_id, "SKIPPED", batch_id)
@@ -726,6 +826,7 @@ def process_batch(batch_id: str) -> None:
                     continue
                 current = get_batch(batch_id)
                 logger.warning(f"Batch {batch_id}: Signup failed for {identity.account_id}")
+                mark_phone_status(identity.phone, "FAILED")
                 update_batch(batch_id, failed=current["failed"] + 1, attempted=current["attempted"] + 1)
                 finalize_identity(identity.test_id, "FAILED", batch_id)
                 break
@@ -818,6 +919,7 @@ def startup() -> None:
     logger.info(f"Worker ID: {WORKER_ID}")
     logger.info(f"Database path: {DATABASE_PATH}")
     initialize_database()
+    load_used_phones()
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
@@ -1078,3 +1180,18 @@ def list_workers():
         "recent_jobs": jobs,
         "timestamp": now()
     }
+
+
+@app.get("/accounts/stats", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
+def account_stats():
+    with closing(connect()) as connection:
+        total_used = connection.execute("SELECT COUNT(DISTINCT phone) FROM used_phone_numbers").fetchone()[0]
+        total_accounts = connection.execute("SELECT COUNT(*) FROM accounts WHERE status = 'SUCCESS'").fetchone()[0]
+    return {
+        "total_unique_phones_reserved": total_used,
+        "total_successful_signups": total_accounts,
+        "in_memory_cache_size": len(global_used_phones),
+        "no_reuse_guarantee": True,
+        "timestamp": now()
+    }
+
