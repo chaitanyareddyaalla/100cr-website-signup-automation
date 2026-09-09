@@ -4,5 +4,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY worker worker
 COPY backend backend
-COPY data data
+RUN mkdir -p data
 CMD ["python", "worker/worker.py"]
