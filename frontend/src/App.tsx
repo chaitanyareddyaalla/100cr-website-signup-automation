@@ -24,6 +24,7 @@ function App() {
   const [operation, setOperation] = useState<'start' | 'pause' | 'resume' | 'stop' | null>(null)
   const [error, setError] = useState('')
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
+  const [accounts, setAccounts] = useState<any[]>([])
 
   // Admin Data
   const [readiness, setReadiness] = useState<Readiness | null>(null)
@@ -73,6 +74,21 @@ function App() {
 
       const events = new EventSource(`${apiUrl}/batches/${batchId}/events`)
 
+      function fetchAccounts() {
+        if (!isActive) return
+        fetch(`${apiUrl}/batches/${batchId}/accounts?limit=50`)
+          .then((res) => res.json())
+          .then((data) => {
+            if (isActive && data?.accounts) {
+              setAccounts(data.accounts)
+            }
+          })
+          .catch(() => {})
+      }
+
+      fetchAccounts()
+      const accInterval = setInterval(fetchAccounts, 3000)
+
       events.onopen = () => {
         if (isActive) {
           setConnectionStatus('connected')
@@ -83,9 +99,11 @@ function App() {
         try {
           const nextBatch = JSON.parse(event.data) as Batch
           setBatch(nextBatch)
+          fetchAccounts()
           if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(nextBatch.status)) {
             events.close()
             setConnectionStatus('disconnected')
+            clearInterval(accInterval)
           }
         } catch {
           // ignore parsing error keepalive
@@ -96,6 +114,7 @@ function App() {
         if (!isActive) return
 
         events.close()
+        clearInterval(accInterval)
         setConnectionStatus('reconnecting')
 
         reconnectTimeout = window.setTimeout(() => {
@@ -342,6 +361,50 @@ function App() {
                       </a>
                     </div>
                   </div>
+
+                  {/* Registered Accounts & Passwords Table */}
+                  {accounts.length > 0 && (
+                    <div style={{ marginTop: '24px', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '16px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                        <p className="card-label" style={{ margin: 0 }}>LIVE SIGNUPS & PASSWORDS ({accounts.length})</p>
+                        <span style={{ fontSize: '0.75rem', color: '#10b981' }}>● Live Updating</span>
+                      </div>
+                      <div style={{ overflowX: 'auto', maxHeight: '280px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8125rem' }}>
+                          <thead>
+                            <tr style={{ background: 'rgba(255,255,255,0.03)', borderBottom: '1px solid rgba(255,255,255,0.08)', color: 'var(--text-dim)', textAlign: 'left' }}>
+                              <th style={{ padding: '10px 12px' }}>Phone Number</th>
+                              <th style={{ padding: '10px 12px' }}>Password</th>
+                              <th style={{ padding: '10px 12px' }}>Place</th>
+                              <th style={{ padding: '10px 12px' }}>Status</th>
+                              <th style={{ padding: '10px 12px' }}>Time</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {accounts.map((acc, i) => (
+                              <tr key={acc.id || i} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                                <td style={{ padding: '8px 12px', fontWeight: 600, color: '#38bdf8', fontFamily: 'var(--font-mono)' }}>
+                                  {acc.phone}
+                                </td>
+                                <td style={{ padding: '8px 12px', color: '#34d399', fontFamily: 'var(--font-mono)' }}>
+                                  {acc.password}
+                                </td>
+                                <td style={{ padding: '8px 12px' }}>{acc.place || 'Hyderabad'}</td>
+                                <td style={{ padding: '8px 12px' }}>
+                                  <span className="status-badge SUCCESS" style={{ fontSize: '0.7rem', padding: '2px 6px' }}>
+                                    {acc.status}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '8px 12px', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
+                                  {acc.created_at ? new Date(acc.created_at).toLocaleTimeString() : ''}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </>
               ) : (
                 <div className="empty-state">

@@ -154,6 +154,39 @@ def initialize_database() -> None:
             "CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, "
             "status TEXT NOT NULL, error TEXT, attempt_number INTEGER NOT NULL, created_at TEXT NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS accounts ("
+            "id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, phone TEXT NOT NULL, password TEXT NOT NULL, "
+            "name TEXT, place TEXT, referral TEXT, language TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        # Backfill accounts from results_export.jsonl if present
+        export_file = RESULTS_PATH if 'RESULTS_PATH' in globals() else (DATABASE_PATH.parent / "results_export.jsonl")
+        if export_file.exists():
+            try:
+                with export_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            data = json.loads(line)
+                            if data.get("phone") and data.get("batch_id"):
+                                connection.execute(
+                                    "INSERT OR IGNORE INTO accounts (id, batch_id, phone, password, name, place, referral, language, status, created_at) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (
+                                        data.get("id") or str(uuid4()),
+                                        data["batch_id"],
+                                        data["phone"],
+                                        data.get("password", ""),
+                                        data.get("name", ""),
+                                        data.get("place", ""),
+                                        data.get("referral", ""),
+                                        data.get("language", ""),
+                                        data.get("status", "SUCCESS"),
+                                        data.get("created_at", now()),
+                                    )
+                                )
+            except Exception as e:
+                logger.warning(f"Accounts backfill skipped: {e}")
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
         for name, definition in (
             ("skipped", "INTEGER NOT NULL DEFAULT 0"),
@@ -620,6 +653,27 @@ def process_batch(batch_id: str) -> None:
                     logger.info(f"Batch {batch_id}: Signup successful for {identity.account_id}")
                     recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
                     if recorded_batch is not None:
+                        try:
+                            with closing(connect()) as conn_acc:
+                                conn_acc.execute(
+                                    "INSERT OR REPLACE INTO accounts (id, batch_id, phone, password, name, place, referral, language, status, created_at) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (
+                                        result.account_id,
+                                        batch_id,
+                                        identity.phone,
+                                        getattr(identity, "password", ""),
+                                        identity.name,
+                                        getattr(identity, "place", ""),
+                                        recorded_batch["referral"],
+                                        getattr(identity, "language", ""),
+                                        result.status,
+                                        getattr(result, "timestamp", now()),
+                                    ),
+                                )
+                                conn_acc.commit()
+                        except Exception as err:
+                            logger.warning(f"Could not record account into accounts table: {err}")
                         append_result({
                             "id": result.account_id,
                             "name": identity.name,
@@ -922,26 +976,48 @@ async def batch_events(batch_id: str) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+@app.get("/batches/{batch_id}/accounts")
+def get_batch_accounts(batch_id: str, limit: int = 200):
+    with closing(connect()) as connection:
+        rows = connection.execute(
+            "SELECT id, batch_id, phone, password, name, place, referral, language, status, created_at "
+            "FROM accounts WHERE batch_id = ? ORDER BY created_at DESC LIMIT ?",
+            (batch_id, limit),
+        ).fetchall()
+        return {"accounts": [dict(r) for r in rows]}
+
+
 @app.get("/batches/{batch_id}/export/csv", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
 def export_batch_csv(batch_id: str):
     batch = get_batch(batch_id)
     with closing(connect()) as connection:
-        attempts = connection.execute(
-            "SELECT id, job_id, status, error, attempt_number, created_at FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?)",
+        accounts = connection.execute(
+            "SELECT phone, password, place, referral, name, language, status, created_at, id FROM accounts WHERE batch_id = ? ORDER BY created_at ASC",
             (batch_id,)
         ).fetchall()
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Batch ID", "Referral", "Batch Status", "Attempt ID", "Job ID", "Attempt Status", "Error", "Attempt Number", "Created At"])
-    if attempts:
-        for att in attempts:
-            writer.writerow([batch_id, batch["referral"], batch["status"], att["id"], att["job_id"], att["status"], att["error"] or "", att["attempt_number"], att["created_at"]])
+    writer.writerow(["Phone Number", "Password", "Place", "Referral Code", "Name", "Language", "Status", "Timestamp", "Account ID", "Batch ID"])
+    if accounts:
+        for acc in accounts:
+            writer.writerow([
+                acc["phone"],
+                acc["password"],
+                acc["place"] or "",
+                acc["referral"] or batch.get("referral", ""),
+                acc["name"] or "",
+                acc["language"] or "",
+                acc["status"],
+                acc["created_at"],
+                acc["id"],
+                batch_id,
+            ])
     else:
-        writer.writerow([batch_id, batch["referral"], batch["status"], "N/A", "N/A", batch["status"], "", 0, batch["created_at"]])
+        writer.writerow(["N/A", "N/A", "N/A", batch.get("referral", "N/A"), "N/A", "N/A", batch.get("status", "N/A"), batch.get("created_at", ""), "N/A", batch_id])
 
     output.seek(0)
-    filename = f"batch_{batch_id[:8]}_export.csv"
+    filename = f"batch_{batch_id[:8]}_accounts.csv"
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
@@ -953,17 +1029,17 @@ def export_batch_csv(batch_id: str):
 def export_batch_json(batch_id: str):
     batch = get_batch(batch_id)
     with closing(connect()) as connection:
-        attempts = [dict(row) for row in connection.execute(
-            "SELECT id, job_id, status, error, attempt_number, created_at FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?)",
+        accounts = [dict(row) for row in connection.execute(
+            "SELECT id, phone, password, name, place, referral, language, status, created_at FROM accounts WHERE batch_id = ? ORDER BY created_at ASC",
             (batch_id,)
         ).fetchall()]
 
     data = {
         "batch": batch,
-        "attempts": attempts,
+        "accounts": accounts,
         "exported_at": now(),
     }
-    filename = f"batch_{batch_id[:8]}_export.json"
+    filename = f"batch_{batch_id[:8]}_accounts.json"
     return StreamingResponse(
         iter([json.dumps(data, indent=2)]),
         media_type="application/json",
