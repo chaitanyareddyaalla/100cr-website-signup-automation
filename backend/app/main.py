@@ -126,7 +126,7 @@ def now() -> str:
 
 def connect() -> sqlite3.Connection:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=60.0)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -134,6 +134,11 @@ def connect() -> sqlite3.Connection:
 def initialize_database() -> None:
     logger.info("Initializing database...")
     with closing(connect()) as connection:
+        try:
+            connection.execute("PRAGMA journal_mode=WAL;")
+            connection.execute("PRAGMA busy_timeout=60000;")
+        except Exception as e:
+            logger.warning(f"Could not enable WAL mode: {e}")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS batches ("
             "id TEXT PRIMARY KEY, referral TEXT NOT NULL, target INTEGER NOT NULL, "
@@ -738,20 +743,27 @@ def process_batch(batch_id: str) -> None:
         cleanup_worker_events(batch_id)
 
 
-def worker_loop() -> None:
-    logger.info("Worker loop started")
+def worker_loop(worker_name: str = "worker-1") -> None:
+    logger.info(f"Worker loop started: {worker_name}")
+    last_recovery = 0.0
     while True:
-        recovered = recover_abandoned_jobs()
-        if recovered > 0:
-            logger.info(f"Recovered {recovered} abandoned jobs")
+        now_ts = time.monotonic()
+        if now_ts - last_recovery > 30.0:
+            last_recovery = now_ts
+            try:
+                recovered = recover_abandoned_jobs()
+                if recovered > 0:
+                    logger.info(f"[{worker_name}] Recovered {recovered} abandoned jobs")
+            except Exception:
+                pass
         try:
-            batch_id = job_queue.get(timeout=0.2)
+            batch_id = job_queue.get(timeout=0.5)
         except Empty:
             continue
         try:
             process_batch(batch_id)
         except Exception as e:
-            logger.error(f"Error in worker loop for batch {batch_id}: {e}", exc_info=True)
+            logger.error(f"Error in {worker_name} for batch {batch_id}: {e}", exc_info=True)
             cleanup_worker_events(batch_id)
         finally:
             job_queue.task_done()
@@ -809,9 +821,16 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    worker_thread = threading.Thread(target=worker_loop, daemon=True, name="mock-worker")
-    worker_thread.start()
-    logger.info("Startup complete")
+    num_workers = int(os.getenv("CONCURRENT_WORKERS", "10"))
+    for i in range(num_workers):
+        worker_thread = threading.Thread(
+            target=worker_loop,
+            args=(f"worker-{i+1}",),
+            daemon=True,
+            name=f"worker-{i+1}",
+        )
+        worker_thread.start()
+    logger.info(f"Startup complete with {num_workers} concurrent background workers")
 
 
 @app.get("/")
