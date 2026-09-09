@@ -731,7 +731,7 @@ app.add_middleware(
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
     """Bound local rate limiting; Redis should replace this for multi-instance use."""
-    if request.url.path in {"/health", "/ready"}:
+    if request.url.path in {"/health", "/healthz", "/ready"}:
         return await call_next(request)
     limit = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "100"))
     client = request.client.host if request.client else "unknown"
@@ -766,6 +766,7 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
+@app.get("/healthz")
 def health() -> dict[str, str]:
     try:
         with closing(connect()) as connection:
