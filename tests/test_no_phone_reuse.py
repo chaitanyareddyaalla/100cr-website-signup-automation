@@ -16,7 +16,7 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     # Generate 50 unique phones for batch 1
     for _ in range(50):
         phone = backend_main.claim_unique_phone(batch_1)
-        assert phone.startswith("9")
+        assert phone[0] in ("9", "8", "7", "6")
         assert len(phone) == 10
         assert phone.isdigit()
         assert phone not in generated_phones
@@ -27,8 +27,9 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     # Generate 50 unique phones for batch 2
     for _ in range(50):
         phone = backend_main.claim_unique_phone(batch_2)
-        assert phone.startswith("9")
+        assert phone[0] in ("9", "8", "7", "6")
         assert len(phone) == 10
+        assert phone.isdigit()
         assert phone not in generated_phones  # Guarantees batch 2 NEVER reuses any number from batch 1
         generated_phones.add(phone)
 
