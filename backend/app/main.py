@@ -152,7 +152,7 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def with_write_retry(fn, max_attempts: int = 5):
+def with_write_retry(fn, max_attempts: int = 10):
     """Retry SQLite write operations if another worker holds the lock."""
     for attempt in range(max_attempts):
         try:
@@ -163,7 +163,7 @@ def with_write_retry(fn, max_attempts: int = 5):
                 raise
             if attempt == max_attempts - 1:
                 raise
-            time.sleep(0.02 * (2 ** attempt))
+            time.sleep(0.01 * (1.5 ** attempt))
 
 
 def acquire_signup_slot() -> None:
