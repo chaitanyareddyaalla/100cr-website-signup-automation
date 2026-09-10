@@ -16,6 +16,7 @@ export type Batch = {
   estimated_remaining: number
   status: BatchStatus
   created_at: string
+  error_message?: string | null
 }
 
 export type Readiness = {
@@ -47,8 +48,17 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export function createBatch(referral: string) {
-  return request<Batch>('/batches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ referral }) })
+export function listBatches(limit = 20, status?: string) {
+  const query = status ? `?limit=${limit}&status=${status}` : `?limit=${limit}`
+  return request<Batch[]>(`/batches${query}`)
+}
+
+export function createBatch(referral: string, autoStart = true) {
+  return request<Batch>(`/batches?auto_start=${autoStart}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ referral, auto_start: autoStart }),
+  })
 }
 
 export function getBatch(id: string) {

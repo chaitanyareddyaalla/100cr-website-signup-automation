@@ -66,6 +66,7 @@ class BatchResponse(BaseModel):
     estimated_remaining: int = 0
     status: BatchStatus
     created_at: str
+    error_message: Optional[str] = None
 
 
 class HealthResponse(BaseModel):

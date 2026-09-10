@@ -730,3 +730,48 @@ def test_write_retry_on_locked_database(monkeypatch) -> None:
 
     assert backend_main.with_write_retry(flaky) == 7
     assert calls["n"] == 2
+
+
+def test_list_batches_endpoint() -> None:
+    with TestClient(app) as client:
+        b1 = client.post("/batches", json={"referral": "LIST1"}).json()
+        b2 = client.post("/batches", json={"referral": "LIST2"}).json()
+        res = client.get("/batches")
+        assert res.status_code == 200
+        batch_ids = [b["id"] for b in res.json()]
+        assert b1["id"] in batch_ids
+        assert b2["id"] in batch_ids
+
+
+def test_post_batch_with_auto_start() -> None:
+    with TestClient(app) as client:
+        res = client.post("/batches", json={"referral": "AUTOSTART", "auto_start": True})
+        assert res.status_code == 200
+        data = res.json()
+        # Batches that auto start enter QUEUED (or RUNNING if worker picks up)
+        assert data["status"] in ("QUEUED", "RUNNING")
+
+
+def test_recover_abandoned_jobs_does_not_queue_completed_batches() -> None:
+    batch = queued_batch(1)
+    backend_main.update_batch(batch["id"], status="COMPLETED")
+    job_id = "test-job-completed"
+    with backend_main.closing(backend_main.connect()) as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, batch_id, status, heartbeat_at) VALUES (?, ?, 'RUNNING', '2020-01-01T00:00:00+00:00')",
+            (job_id, batch["id"]),
+        )
+        conn.commit()
+
+    recovered = backend_main.recover_abandoned_jobs()
+    assert recovered == 0
+    with backend_main.closing(backend_main.connect()) as conn:
+        job = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert job["status"] == "COMPLETED"
+
+
+def test_claim_job_rejects_non_queued_batch() -> None:
+    batch = queued_batch(1)
+    backend_main.update_batch(batch["id"], status="COMPLETED")
+    job_id = backend_main.claim_job(batch["id"])
+    assert job_id is None

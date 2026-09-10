@@ -86,6 +86,7 @@ ALLOWED_STATE_TRANSITIONS: dict[str, set[str]] = {
 
 class ReferralRequest(BaseModel):
     referral: str = Field(min_length=1, max_length=120)
+    auto_start: bool = False
 
 
 class BatchResponse(BaseModel):
@@ -104,6 +105,7 @@ class BatchResponse(BaseModel):
     estimated_remaining: int = 0
     status: BatchStatus
     created_at: str
+    error_message: str | None = None
 
 
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
@@ -113,7 +115,7 @@ RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
 MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "2"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
-WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "30"))
+WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
 _signup_slot_lock = threading.Lock()
 _signup_in_flight = 0
@@ -165,7 +167,7 @@ def with_write_retry(fn, max_attempts: int = 5):
 def acquire_signup_slot() -> None:
     global _signup_in_flight
     while True:
-        cap = max(1, int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")))
+        cap = max(10, int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")))
         with _signup_slot_lock:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
@@ -191,6 +193,8 @@ def _export_loop() -> None:
 
 
 def schedule_export(row: dict) -> None:
+    if os.getenv("ENABLE_DATA_STORAGE", "false").lower() != "true" and not os.getenv("GOOGLE_SHEETS_ID"):
+        return
     if not _export_started.is_set():
         with _export_init_lock:
             if not _export_started.is_set():
@@ -218,7 +222,7 @@ def initialize_database() -> None:
             connection.execute("PRAGMA journal_mode=WAL;")
             connection.execute("PRAGMA busy_timeout=60000;")
             connection.execute("PRAGMA synchronous=NORMAL;")
-            connection.execute("PRAGMA cache_size=-64000;")
+            connection.execute("PRAGMA cache_size=-2000;")
         except Exception as e:
             logger.warning(f"Could not enable WAL mode: {e}")
         connection.execute(
@@ -246,35 +250,6 @@ def initialize_database() -> None:
             "id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, phone TEXT NOT NULL, password TEXT NOT NULL, "
             "name TEXT, place TEXT, referral TEXT, language TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)"
         )
-        # Backfill accounts from results_export.jsonl if present
-        export_file = globals().get('RESULTS_PATH', DATABASE_PATH.parent / "results_export.jsonl")
-        if export_file.exists():
-            try:
-                with export_file.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            data = json.loads(line)
-                            if data.get("phone") and data.get("batch_id"):
-                                connection.execute(
-                                    "INSERT OR IGNORE INTO accounts (id, batch_id, phone, password, name, place, referral, language, status, created_at) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (
-                                        data.get("id") or str(uuid4()),
-                                        data["batch_id"],
-                                        data["phone"],
-                                        data.get("password", ""),
-                                        data.get("name", ""),
-                                        data.get("place", ""),
-                                        data.get("referral", ""),
-                                        data.get("language", ""),
-                                        data.get("status", "SUCCESS"),
-                                        data.get("created_at", now()),
-                                    )
-                                )
-            except Exception as e:
-                logger.warning(f"Accounts backfill skipped: {e}")
-
         connection.execute(
             "CREATE TABLE IF NOT EXISTS used_phone_numbers ("
             "phone TEXT PRIMARY KEY, batch_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)"
@@ -294,6 +269,7 @@ def initialize_database() -> None:
             ("retries", "INTEGER NOT NULL DEFAULT 0"),
             ("started_at", "TEXT"),
             ("completed_at", "TEXT"),
+            ("error_message", "TEXT"),
         ):
             if name not in columns:
                 try:
@@ -307,14 +283,18 @@ def initialize_database() -> None:
 
 def get_batch(batch_id: str) -> dict:
     with closing(connect()) as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
+        err_col = ", error_message" if "error_message" in columns else ""
         row = connection.execute(
-            "SELECT id, referral, target, successful, failed, skipped, attempted, retries, status, "
-            "created_at, started_at, completed_at FROM batches WHERE id = ?",
+            f"SELECT id, referral, target, successful, failed, skipped, attempted, retries, status, "
+            f"created_at, started_at, completed_at{err_col} FROM batches WHERE id = ?",
             (batch_id,),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Batch not found")
     batch = dict(row)
+    if "error_message" not in batch:
+        batch["error_message"] = None
     progress = calculate_batch_progress(batch)
     batch.update(progress)
     return batch
@@ -438,32 +418,28 @@ def create_job(batch_id: str) -> str:
 def claim_job(batch_id: str) -> str | None:
     with closing(connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
+        batch = connection.execute(
+            "SELECT status FROM batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if batch is None or batch["status"] != BatchStatus.QUEUED.value:
+            connection.rollback()
+            return None
+
         row = connection.execute(
             "SELECT id FROM jobs WHERE batch_id = ? AND status = 'QUEUED' ORDER BY rowid LIMIT 1",
             (batch_id,),
         ).fetchone()
+        timestamp = now()
         if row is None:
-            batch = connection.execute(
-                "SELECT status FROM batches WHERE id = ?",
-                (batch_id,),
-            ).fetchone()
-            if batch is None or batch["status"] != BatchStatus.QUEUED.value:
-                connection.rollback()
-                return None
             job_id = str(uuid4())
             connection.execute(
-                "INSERT INTO jobs (id, batch_id, status) VALUES (?, ?, 'RUNNING')",
-                (job_id, batch_id),
-            )
-            timestamp = now()
-            connection.execute(
-                "UPDATE jobs SET worker_id = ?, started_at = ?, heartbeat_at = ? WHERE id = ?",
-                (WORKER_ID, timestamp, timestamp, job_id),
+                "INSERT INTO jobs (id, batch_id, status, worker_id, started_at, heartbeat_at) VALUES (?, ?, 'RUNNING', ?, ?, ?)",
+                (job_id, batch_id, WORKER_ID, timestamp, timestamp),
             )
             connection.commit()
             return job_id
         job_id = row["id"]
-        timestamp = now()
         connection.execute(
             "UPDATE jobs SET status = 'RUNNING', worker_id = ?, started_at = ?, heartbeat_at = ? WHERE id = ? AND status = 'QUEUED'",
             (WORKER_ID, timestamp, timestamp, job_id),
@@ -496,14 +472,30 @@ def recover_abandoned_jobs() -> int:
     try:
         with closing(connect()) as connection:
             rows = connection.execute(
-                "SELECT id, batch_id, heartbeat_at FROM jobs WHERE status = 'RUNNING'"
+                """
+                SELECT j.id, j.batch_id, j.heartbeat_at, b.status as batch_status
+                FROM jobs j
+                LEFT JOIN batches b ON j.batch_id = b.id
+                WHERE j.status = 'RUNNING'
+                """
             ).fetchall()
             for row in rows:
                 heartbeat = row["heartbeat_at"]
+                batch_status = row["batch_status"]
                 if not heartbeat or datetime.fromisoformat(heartbeat).timestamp() < cutoff:
+                    if batch_status in (BatchStatus.COMPLETED.value, BatchStatus.CANCELLED.value, BatchStatus.FAILED.value):
+                        connection.execute(
+                            "UPDATE jobs SET status = ?, acknowledged_at = ? WHERE id = ?",
+                            (batch_status, now(), row["id"]),
+                        )
+                        continue
                     connection.execute(
                         "UPDATE jobs SET status = 'QUEUED', worker_id = NULL, started_at = NULL, heartbeat_at = NULL WHERE id = ?",
                         (row["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE batches SET status = 'QUEUED', updated_at = ? WHERE id = ? AND status != 'QUEUED'",
+                        (now(), row["batch_id"]),
                     )
                     job_queue.put(row["batch_id"])
                     recovered += 1
@@ -608,13 +600,13 @@ def load_used_phones() -> None:
     try:
         with closing(connect()) as connection:
             rows = connection.execute(
-                "SELECT phone FROM used_phone_numbers UNION SELECT phone FROM accounts"
+                "SELECT phone FROM used_phone_numbers ORDER BY rowid DESC LIMIT 500"
             ).fetchall()
             for r in rows:
                 p = r["phone"]
                 if p:
                     global_used_phones.add(p)
-        logger.info(f"Loaded {len(global_used_phones)} previously used phone numbers into memory (no-reuse guarantee)")
+        logger.info(f"Loaded {len(global_used_phones)} recent phone numbers into memory")
     except Exception as e:
         logger.warning(f"Could not load used phone numbers: {e}")
 
@@ -624,6 +616,10 @@ def claim_unique_phone(batch_id: str) -> str:
 
     Guarantees no two batches, devices, or workers will EVER reuse or generate the same phone number.
     """
+    global global_used_phones
+    if len(global_used_phones) > 5000:
+        global_used_phones.clear()
+
     with closing(connect()) as connection:
         while True:
             candidate = generate_phone()
@@ -794,6 +790,8 @@ def _build_identity(batch_id: str, referral: str) -> TestIdentity:
 
 
 def _record_account(identity: TestIdentity, result, batch_id: str, referral: str) -> None:
+    if os.getenv("ENABLE_DATA_STORAGE", "false").lower() != "true":
+        return
     def _do() -> None:
         with closing(connect()) as connection:
             connection.execute(
@@ -821,6 +819,8 @@ def _record_account(identity: TestIdentity, result, batch_id: str, referral: str
 
 
 def _insert_attempt(job_id: str, status: str, error: str, attempt_number: int) -> None:
+    if os.getenv("ENABLE_DATA_STORAGE", "false").lower() != "true":
+        return
     def _do() -> None:
         with closing(connect()) as connection:
             connection.execute(
@@ -830,9 +830,9 @@ def _insert_attempt(job_id: str, status: str, error: str, attempt_number: int) -
             connection.commit()
 
     try:
-        with_write_retry(_do)
+        with_write_retry(_do, max_attempts=2)
     except Exception:
-        logger.warning("Could not record signup attempt")
+        pass
 
 
 def process_batch(batch_id: str) -> None:
@@ -851,12 +851,27 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id, "SKIPPED")
             return
 
+        hb_stop = threading.Event()
+
+        def _auto_heartbeat() -> None:
+            while not hb_stop.wait(5.0):
+                try:
+                    heartbeat_job(job_id)
+                except Exception:
+                    pass
+
+        hb_thread = threading.Thread(
+            target=_auto_heartbeat, daemon=True, name=f"hb-{job_id[:8]}"
+        )
+        hb_thread.start()
+
         max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "30"))
         concurrency = max(
             1,
             min(
                 int(os.getenv("SIGNUP_CONCURRENCY", "50")),
                 int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")),
+                max_consecutive_failures,
             ),
         )
         limit_reached_event = threading.Event()
@@ -864,9 +879,10 @@ def process_batch(batch_id: str) -> None:
         fail_lock = threading.Lock()
         consecutive_failures = 0
         fatal: list[BaseException] = []
+        batch_error_msg = ""
 
         def run_one(identity: TestIdentity) -> None:
-            nonlocal consecutive_failures
+            nonlocal consecutive_failures, batch_error_msg
             acquire_signup_slot()
             try:
                 if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set():
@@ -911,6 +927,7 @@ def process_batch(batch_id: str) -> None:
                             })
                         return
                     if result.status == "LIMIT_REACHED":
+                        batch_error_msg = getattr(result, "error", "") or "This referral code has reached its maximum limit on the target website."
                         logger.warning("Batch %s: referral reached maximum limit; stopping new signups", batch_id)
                         mark_phone_status(identity.phone, "FAILED")
                         limit_reached_event.set()
@@ -951,6 +968,7 @@ def process_batch(batch_id: str) -> None:
                     with fail_lock:
                         consecutive_failures += 1
                         if consecutive_failures >= max_consecutive_failures:
+                            batch_error_msg = f"Circuit breaker tripped after {consecutive_failures} consecutive failures on the target website."
                             logger.error(
                                 "Batch %s: circuit breaker after %s consecutive failures",
                                 batch_id,
@@ -1031,7 +1049,8 @@ def process_batch(batch_id: str) -> None:
             return
         if limit_reached_event.is_set() or circuit_event.is_set():
             final_status = BatchStatus.COMPLETED.value if batch["successful"] > 0 else BatchStatus.FAILED.value
-            update_batch(batch_id, status=final_status, completed_at=now())
+            err_msg = batch_error_msg or ("Referral limit reached on target site" if limit_reached_event.is_set() else f"Stopped after {max_consecutive_failures} consecutive failures")
+            update_batch(batch_id, status=final_status, completed_at=now(), error_message=err_msg)
             acknowledge_job(job_id, final_status)
             return
         if batch["status"] != BatchStatus.RUNNING.value:
@@ -1043,11 +1062,16 @@ def process_batch(batch_id: str) -> None:
         try:
             batch = get_batch(batch_id)
             if batch["status"] not in (BatchStatus.CANCELLED.value, BatchStatus.COMPLETED.value):
-                update_batch(batch_id, status=BatchStatus.FAILED.value)
+                update_batch(batch_id, status=BatchStatus.FAILED.value, error_message=str(e))
         finally:
             acknowledge_job(job_id, "FAILED")
             raise
     finally:
+        try:
+            if "hb_stop" in locals():
+                hb_stop.set()
+        except Exception:
+            pass
         cleanup_worker_events(batch_id)
 
 
@@ -1148,7 +1172,7 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = int(os.getenv("CONCURRENT_WORKERS", "20"))
+    num_workers = max(10, int(os.getenv("CONCURRENT_WORKERS", "20")))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,
@@ -1220,9 +1244,28 @@ def seed_identities(data: SeedIdentitiesRequest) -> dict[str, object]:
     return {"seeded": count, "total_requested": len(data.identifiers)}
 
 
+@app.get("/batches", response_model=list[BatchResponse], dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
+def list_batches(limit: int = 50, status: str | None = None) -> list[dict]:
+    with closing(connect()) as connection:
+        if status:
+            rows = connection.execute(
+                "SELECT id FROM batches WHERE status = ? ORDER BY rowid DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT id FROM batches ORDER BY rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [get_batch(row["id"]) for row in rows]
+
+
 @app.post("/batches", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
-def post_batch(data: ReferralRequest) -> dict:
-    return create_batch(data.referral)
+def post_batch(data: ReferralRequest, auto_start: bool = False) -> dict:
+    batch = create_batch(data.referral)
+    if auto_start or getattr(data, "auto_start", False):
+        return start_batch(batch["id"])
+    return batch
 
 
 @app.get("/batches/{batch_id}", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])

@@ -6,7 +6,7 @@ import {
   getReadiness,
   getWorkers,
   updateBatch,
-  getExportUrl,
+  listBatches,
   API_URL,
   type Batch,
   type Readiness,
@@ -21,18 +21,19 @@ function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard')
   const [referral, setReferral] = useState('')
   const [batch, setBatch] = useState<Batch | null>(null)
+  const [batchesList, setBatchesList] = useState<Batch[]>([])
+  const [autoStart, setAutoStart] = useState(true)
   const [loading, setLoading] = useState(false)
   const [operation, setOperation] = useState<'start' | 'pause' | 'resume' | 'stop' | null>(null)
   const [error, setError] = useState('')
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
-  const [accounts, setAccounts] = useState<any[]>([])
 
   // Admin Data
   const [readiness, setReadiness] = useState<Readiness | null>(null)
   const [workerInfo, setWorkerInfo] = useState<WorkerInfo | null>(null)
   const [healthStatus, setHealthStatus] = useState<string>('checking...')
 
-  // Fetch admin stats when admin tab is opened or periodically
+  // Fetch admin stats & batches list periodically
   useEffect(() => {
     async function fetchAdminData() {
       try {
@@ -48,9 +49,37 @@ function App() {
         setHealthStatus('error')
       }
     }
+
+    async function fetchBatches() {
+      try {
+        const list = await listBatches(30)
+        if (list && Array.isArray(list)) {
+          setBatchesList(list)
+          setBatch((prev) => {
+            if (!prev && list.length > 0) {
+              const active = list.find((b) => b.status === 'RUNNING' || b.status === 'QUEUED') || list[0]
+              return active
+            }
+            if (prev) {
+              const updated = list.find((b) => b.id === prev.id)
+              return updated || prev
+            }
+            return prev
+          })
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     fetchAdminData()
+    fetchBatches()
     const interval = setInterval(fetchAdminData, 5000)
-    return () => clearInterval(interval)
+    const bInterval = setInterval(fetchBatches, 3000)
+    return () => {
+      clearInterval(interval)
+      clearInterval(bInterval)
+    }
   }, [])
 
   // SSE & Live Status Updates
@@ -74,21 +103,6 @@ function App() {
 
       const events = new EventSource(`${API_URL}/batches/${batchId}/events`)
 
-      function fetchAccounts() {
-        if (!isActive) return
-        fetch(`${API_URL}/batches/${batchId}/accounts?limit=50`)
-          .then((res) => res.json())
-          .then((data) => {
-            if (isActive && data?.accounts) {
-              setAccounts(data.accounts)
-            }
-          })
-          .catch(() => {})
-      }
-
-      fetchAccounts()
-      const accInterval = setInterval(fetchAccounts, 3000)
-
       events.onopen = () => {
         if (isActive) {
           setConnectionStatus('connected')
@@ -99,11 +113,10 @@ function App() {
         try {
           const nextBatch = JSON.parse(event.data) as Batch
           setBatch(nextBatch)
-          fetchAccounts()
           if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(nextBatch.status)) {
+            isActive = false
             events.close()
             setConnectionStatus('disconnected')
-            clearInterval(accInterval)
           }
         } catch {
           // ignore parsing error keepalive
@@ -112,16 +125,16 @@ function App() {
 
       events.onerror = () => {
         if (!isActive) return
-
         events.close()
-        clearInterval(accInterval)
+        if (batch?.status && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(batch.status)) {
+          return
+        }
         setConnectionStatus('reconnecting')
-
         reconnectTimeout = window.setTimeout(() => {
           if (isActive) {
             connectToEvents()
           }
-        }, 3000)
+        }, 4000)
       }
 
       return events
@@ -134,9 +147,9 @@ function App() {
       if (reconnectTimeout) clearTimeout(reconnectTimeout)
       if (events) events.close()
     }
-  }, [batch?.id])
+  }, [batch?.id, batch?.status])
 
-  async function handleCreateBatch() {
+  async function handleCreateBatch(count: number = 1) {
     if (!referral.trim()) {
       setError('Please enter a referral code first.')
       return
@@ -144,8 +157,15 @@ function App() {
     setError('')
     setLoading(true)
     try {
-      const created = await createBatch(referral.trim())
-      setBatch(created)
+      let first: Batch | null = null
+      for (let i = 0; i < count; i++) {
+        const refCode = count > 1 ? `${referral.trim()}-${i + 1}` : referral.trim()
+        const created = await createBatch(refCode, autoStart)
+        if (i === 0) first = created
+      }
+      if (first) setBatch(first)
+      const list = await listBatches(30)
+      setBatchesList(list)
     } catch {
       setError('Could not connect to the backend server.')
     } finally {
@@ -153,15 +173,20 @@ function App() {
     }
   }
 
-  async function handleControl(action: 'start' | 'pause' | 'resume' | 'stop') {
-    if (!batch || operation) return
+  async function handleControl(action: 'start' | 'pause' | 'resume' | 'stop', targetBatchId?: string) {
+    const id = targetBatchId || batch?.id
+    if (!id || operation) return
     setError('')
     setOperation(action)
     try {
-      const updated = await updateBatch(batch.id, action)
-      setBatch(updated)
+      const updated = await updateBatch(id, action)
+      if (!targetBatchId || targetBatchId === batch?.id) {
+        setBatch(updated)
+      }
+      const list = await listBatches(30)
+      setBatchesList(list)
     } catch {
-      setError(`Action '${action}' is not available in state '${batch.status}'.`)
+      setError(`Action '${action}' failed or is not available.`)
     } finally {
       setOperation(null)
     }
@@ -169,6 +194,9 @@ function App() {
 
   const progress = batch ? Math.min(100, Math.max(0, batch.progress_percent ?? 0)) : 0
   const isRunning = batch?.status === 'RUNNING' || batch?.status === 'QUEUED' || batch?.status === 'PAUSED'
+
+  const runningBatchesCount = batchesList.filter((b) => b.status === 'RUNNING').length
+  const queuedBatchesCount = batchesList.filter((b) => b.status === 'QUEUED').length
 
   return (
     <div className="app-container">
@@ -197,13 +225,31 @@ function App() {
 
           {batch && (
             <div className="connection-badge">
-              <span className={`connection-dot ${connectionStatus}`} />
+              <span
+                className={`connection-dot ${
+                  batch.status === 'RUNNING'
+                    ? 'connected'
+                    : batch.status === 'QUEUED'
+                    ? 'reconnecting'
+                    : batch.status === 'COMPLETED'
+                    ? 'connected'
+                    : 'disconnected'
+                }`}
+              />
               <span>
-                {connectionStatus === 'connected'
+                {batch.status === 'RUNNING'
                   ? 'Live Stream'
+                  : batch.status === 'QUEUED'
+                  ? 'Queued'
+                  : batch.status === 'COMPLETED'
+                  ? 'Completed'
+                  : batch.status === 'FAILED'
+                  ? 'Finished / Stopped'
+                  : connectionStatus === 'connected'
+                  ? 'Connected'
                   : connectionStatus === 'reconnecting'
                   ? 'Reconnecting...'
-                  : 'Disconnected'}
+                  : 'Idle'}
               </span>
             </div>
           )}
@@ -216,7 +262,7 @@ function App() {
           <section className="hero">
             <p className="eyebrow">CONTROL PANEL / BATCH OPERATIONS</p>
             <h1>Production Automation Hub</h1>
-            <p>Launch referral batches, track real-time signup progress, and export results.</p>
+            <p>Launch referral batches, scale concurrent tasks (10+ simultaneous), and monitor live signups.</p>
           </section>
 
           <div className="dashboard-grid">
@@ -231,27 +277,54 @@ function App() {
                     className="input-field"
                     value={referral}
                     onChange={(e) => setReferral(e.target.value)}
-                    placeholder="e.g. PROMO2026"
+                    placeholder="e.g. 100CRCLUBW9PKQ69N"
                     maxLength={120}
                   />
                 </div>
               </div>
-              <button
-                type="button"
-                className="btn-primary"
-                style={{ width: '100%' }}
-                onClick={handleCreateBatch}
-                disabled={loading}
-              >
-                {loading ? 'Creating Batch...' : 'Create Batch'}
-              </button>
-              {error && <p className="error-msg">{error}</p>}
+
+              <div style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <input
+                  type="checkbox"
+                  id="auto-start-toggle"
+                  checked={autoStart}
+                  onChange={(e) => setAutoStart(e.target.checked)}
+                  style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
+                />
+                <label htmlFor="auto-start-toggle" style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}>
+                  Auto-start tasks immediately upon creation
+                </label>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  style={{ width: '100%' }}
+                  onClick={() => handleCreateBatch(1)}
+                  disabled={loading}
+                >
+                  {loading ? 'Queueing Task...' : 'Launch 1 Task'}
+                </button>
+
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: '100%', borderColor: 'rgba(59, 130, 246, 0.4)', color: '#38bdf8' }}
+                  onClick={() => handleCreateBatch(10)}
+                  disabled={loading}
+                >
+                  {loading ? 'Queueing Tasks...' : '⚡ Launch 10 Tasks At Once'}
+                </button>
+              </div>
+
+              {error && <p className="error-msg" style={{ marginTop: '12px' }}>{error}</p>}
             </div>
 
             {/* Live Status Card */}
             <div className="card">
               <div className="status-header">
-                <p className="card-label">02 / LIVE STATUS & METRICS</p>
+                <p className="card-label">02 / LIVE FOCUS & METRICS</p>
                 {batch && <span className={`status-badge ${batch.status}`}>{batch.status}</span>}
               </div>
 
@@ -263,6 +336,26 @@ function App() {
                       ID: {batch.id}
                     </div>
                   </div>
+
+                  {batch.status === 'FAILED' && (
+                    <div
+                      style={{
+                        background: 'rgba(239, 68, 68, 0.12)',
+                        border: '1px solid rgba(239, 68, 68, 0.4)',
+                        padding: '12px 16px',
+                        borderRadius: '12px',
+                        marginBottom: '16px',
+                        color: '#fca5a5',
+                        fontSize: '0.875rem',
+                      }}
+                    >
+                      <strong style={{ display: 'block', color: '#f87171', marginBottom: '4px' }}>
+                        ⚠️ Referral Limit Reached or Rejected:
+                      </strong>
+                      {batch.error_message ||
+                        'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}
+                    </div>
+                  )}
 
                   {/* Progress Bar */}
                   <div className="progress-container">
@@ -338,101 +431,6 @@ function App() {
                       </button>
                     )}
                   </div>
-
-                  {/* Export Options */}
-                  <div className="exports-section">
-                    <span className="exports-label">Export Batch Data:</span>
-                    <div className="export-btns">
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={async () => {
-                          try {
-                            const res = await fetch(getExportUrl(batch.id, 'csv'))
-                            const blob = await res.blob()
-                            const url = window.URL.createObjectURL(blob)
-                            const a = document.createElement('a')
-                            a.href = url
-                            a.download = `batch_${batch.id.slice(0, 8)}_accounts.csv`
-                            document.body.appendChild(a)
-                            a.click()
-                            document.body.removeChild(a)
-                            window.URL.revokeObjectURL(url)
-                          } catch {
-                            window.open(getExportUrl(batch.id, 'csv'), '_blank')
-                          }
-                        }}
-                      >
-                        Download CSV
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={async () => {
-                          try {
-                            const res = await fetch(getExportUrl(batch.id, 'json'))
-                            const blob = await res.blob()
-                            const url = window.URL.createObjectURL(blob)
-                            const a = document.createElement('a')
-                            a.href = url
-                            a.download = `batch_${batch.id.slice(0, 8)}_accounts.json`
-                            document.body.appendChild(a)
-                            a.click()
-                            document.body.removeChild(a)
-                            window.URL.revokeObjectURL(url)
-                          } catch {
-                            window.open(getExportUrl(batch.id, 'json'), '_blank')
-                          }
-                        }}
-                      >
-                        Download JSON
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Registered Accounts & Passwords Table */}
-                  {accounts.length > 0 && (
-                    <div style={{ marginTop: '24px', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '16px' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                        <p className="card-label" style={{ margin: 0 }}>LIVE SIGNUPS & PASSWORDS ({accounts.length})</p>
-                        <span style={{ fontSize: '0.75rem', color: '#10b981' }}>● Live Updating</span>
-                      </div>
-                      <div style={{ overflowX: 'auto', maxHeight: '280px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
-                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8125rem' }}>
-                          <thead>
-                            <tr style={{ background: 'rgba(255,255,255,0.03)', borderBottom: '1px solid rgba(255,255,255,0.08)', color: 'var(--text-dim)', textAlign: 'left' }}>
-                              <th style={{ padding: '10px 12px' }}>Phone Number</th>
-                              <th style={{ padding: '10px 12px' }}>Password</th>
-                              <th style={{ padding: '10px 12px' }}>Place</th>
-                              <th style={{ padding: '10px 12px' }}>Status</th>
-                              <th style={{ padding: '10px 12px' }}>Time</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {accounts.map((acc, i) => (
-                              <tr key={acc.id || i} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                                <td style={{ padding: '8px 12px', fontWeight: 600, color: '#38bdf8', fontFamily: 'var(--font-mono)' }}>
-                                  {acc.phone}
-                                </td>
-                                <td style={{ padding: '8px 12px', color: '#34d399', fontFamily: 'var(--font-mono)' }}>
-                                  {acc.password}
-                                </td>
-                                <td style={{ padding: '8px 12px' }}>{acc.place || 'Hyderabad'}</td>
-                                <td style={{ padding: '8px 12px' }}>
-                                  <span className="status-badge SUCCESS" style={{ fontSize: '0.7rem', padding: '2px 6px' }}>
-                                    {acc.status}
-                                  </span>
-                                </td>
-                                <td style={{ padding: '8px 12px', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
-                                  {acc.created_at ? new Date(acc.created_at).toLocaleTimeString() : ''}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
                 </>
               ) : (
                 <div className="empty-state">
@@ -440,6 +438,108 @@ function App() {
                 </div>
               )}
             </div>
+          </div>
+
+          {/* Concurrent Batches & Tasks Overview Table */}
+          <div className="card" style={{ marginBottom: '32px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div>
+                <p className="card-label" style={{ margin: 0 }}>ACTIVE & QUEUED TASKS ({batchesList.length})</p>
+                <div style={{ fontSize: '0.8125rem', color: 'var(--text-dim)', marginTop: '4px' }}>
+                  Running: <strong style={{ color: '#10b981' }}>{runningBatchesCount}</strong> · Queued: <strong style={{ color: '#38bdf8' }}>{queuedBatchesCount}</strong>
+                </div>
+              </div>
+            </div>
+
+            {batchesList.length > 0 ? (
+              <div style={{ overflowX: 'auto', borderRadius: '12px', border: '1px solid var(--border-subtle)' }}>
+                <table className="admin-table" style={{ margin: 0 }}>
+                  <thead>
+                    <tr>
+                      <th>Batch ID</th>
+                      <th>Referral Code</th>
+                      <th>Status</th>
+                      <th>Progress</th>
+                      <th>Success</th>
+                      <th>Failed</th>
+                      <th>Skipped</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {batchesList.map((b) => (
+                      <tr
+                        key={b.id}
+                        style={{
+                          background: batch?.id === b.id ? 'rgba(59, 130, 246, 0.08)' : 'transparent',
+                          cursor: 'pointer',
+                        }}
+                        onClick={() => setBatch(b)}
+                      >
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{b.id.slice(0, 8)}</td>
+                        <td style={{ fontWeight: 600 }}>{b.referral}</td>
+                        <td>
+                          <span className={`status-badge ${b.status}`}>{b.status}</span>
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '120px' }}>
+                            <div style={{ flex: 1, background: 'rgba(255,255,255,0.1)', height: '6px', borderRadius: '3px', overflow: 'hidden' }}>
+                              <div
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, b.progress_percent ?? 0))}%`,
+                                  background: 'var(--accent-blue)',
+                                  height: '100%',
+                                }}
+                              />
+                            </div>
+                            <span style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{b.progress_percent ?? 0}%</span>
+                          </div>
+                        </td>
+                        <td style={{ color: '#34d399', fontWeight: 600 }}>{b.successful}</td>
+                        <td style={{ color: '#f87171' }}>{b.failed}</td>
+                        <td style={{ color: '#fbbf24' }}>{b.skipped ?? 0}</td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '6px' }} onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
+                              className="btn-secondary"
+                              style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                              onClick={() => setBatch(b)}
+                            >
+                              {batch?.id === b.id ? 'Monitoring' : 'Monitor'}
+                            </button>
+                            {b.status === 'RUNNING' && (
+                              <button
+                                type="button"
+                                className="btn-danger"
+                                style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                onClick={() => handleControl('stop', b.id)}
+                              >
+                                Stop
+                              </button>
+                            )}
+                            {b.status === 'CREATED' && (
+                              <button
+                                type="button"
+                                className="btn-primary"
+                                style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                onClick={() => handleControl('start', b.id)}
+                              >
+                                Start
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">
+                <p>No batches found. Launch a batch above to get started.</p>
+              </div>
+            )}
           </div>
         </>
       ) : (
@@ -453,7 +553,9 @@ function App() {
                 <tr>
                   <td>API Status</td>
                   <td>
-                    <span className="status-badge COMPLETED">{healthStatus.toUpperCase()}</span>
+                    <span className={`status-badge ${healthStatus === 'ok' || healthStatus === 'healthy' ? 'COMPLETED' : 'FAILED'}`}>
+                      {healthStatus.toUpperCase()}
+                    </span>
                   </td>
                 </tr>
                 <tr>
@@ -496,7 +598,7 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {workerInfo.recent_jobs.slice(0, 6).map((j) => (
+                  {workerInfo.recent_jobs.slice(0, 10).map((j) => (
                     <tr key={j.id}>
                       <td style={{ fontFamily: 'var(--font-mono)' }}>{j.id.slice(0, 8)}</td>
                       <td style={{ fontFamily: 'var(--font-mono)' }}>{j.batch_id.slice(0, 8)}</td>
