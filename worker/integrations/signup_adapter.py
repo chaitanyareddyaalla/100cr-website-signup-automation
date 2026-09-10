@@ -50,7 +50,7 @@ def _http_pool():
             _HTTP_POOL = urllib3.PoolManager(
                 num_pools=8,
                 maxsize=maxsize,
-                timeout=urllib3.Timeout(connect=10.0, read=30.0),
+                timeout=urllib3.Timeout(connect=10.0, read=15.0),
                 retries=False,
             )
         return _HTTP_POOL
@@ -117,29 +117,37 @@ class AuthorizedPlaywrightAdapter:
 
     def _classify_error_body(self, identity: TestIdentity, body: str, http_status: int = 0) -> SignupResult:
         body_lower = (body or "").lower()
+        clean_msg = body
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and "message" in parsed:
+                clean_msg = str(parsed["message"])
+        except Exception:
+            pass
+
         if http_status == 409 or any(marker in body_lower for marker in _DUPLICATE_MARKERS):
             return SignupResult.duplicate(identity.account_id, phone=identity.phone)
         if any(marker in body_lower for marker in _LIMIT_MARKERS):
             return SignupResult.limit_reached(
                 identity.account_id,
-                error=body or "Referral code maximum limit reached",
+                error=clean_msg or "Referral code maximum limit reached",
                 phone=identity.phone,
             )
         if any(marker in body_lower for marker in _INVALID_REFERRAL_MARKERS):
             return SignupResult(
                 account_id=identity.account_id,
                 status="INVALID_REFERRAL",
-                error=body or "Invalid referral code",
+                error=clean_msg or "Invalid referral code",
                 phone=identity.phone,
             )
         if 500 <= http_status < 600:
             return SignupResult(
                 account_id=identity.account_id,
                 status="SERVER_ERROR",
-                error=body or f"Server error {http_status}",
+                error=clean_msg or f"Server error {http_status}",
                 phone=identity.phone,
             )
-        return SignupResult.failure(identity.account_id, error=body or f"HTTP {http_status}", phone=identity.phone)
+        return SignupResult.failure(identity.account_id, error=clean_msg or f"HTTP {http_status}", phone=identity.phone)
 
     def _browser_signup(self, identity: TestIdentity) -> SignupResult:
         try:

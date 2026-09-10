@@ -112,9 +112,9 @@ class BatchResponse(BaseModel):
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
 MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.0"))
-RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "1.0"))
-MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "0.0"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.3"))
+RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "1.5"))
+MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "1.5"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
@@ -598,7 +598,7 @@ def load_used_phones() -> None:
     try:
         with closing(connect()) as connection:
             rows = connection.execute(
-                "SELECT phone FROM used_phone_numbers ORDER BY rowid DESC LIMIT 500"
+                "SELECT phone FROM used_phone_numbers ORDER BY rowid DESC LIMIT 100000"
             ).fetchall()
             for r in rows:
                 p = r["phone"]
@@ -613,8 +613,8 @@ def claim_unique_phone(batch_id: str) -> str:
     """Generate a fast, unique 10-digit phone number avoiding collisions."""
     global global_used_phones
     with _phone_lock:
-        if len(global_used_phones) > 100000:
-            global_used_phones.clear()
+        if len(global_used_phones) > 300000:
+            global_used_phones = set(list(global_used_phones)[-100000:])
         candidate = generate_phone()
         for _ in range(50):
             if candidate not in global_used_phones:
@@ -832,13 +832,12 @@ def process_batch(batch_id: str) -> None:
         )
         hb_thread.start()
 
-        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "30"))
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "100"))
         concurrency = max(
             1,
             min(
-                int(os.getenv("SIGNUP_CONCURRENCY", "50")),
-                int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")),
-                max_consecutive_failures,
+                int(os.getenv("SIGNUP_CONCURRENCY", "20")),
+                int(os.getenv("MAX_PARALLEL_SIGNUPS", "40")),
             ),
         )
         limit_reached_event = threading.Event()
@@ -940,14 +939,18 @@ def process_batch(batch_id: str) -> None:
                     finalize_identity(identity.test_id, "FAILED", batch_id)
                     with fail_lock:
                         consecutive_failures += 1
-                        if consecutive_failures >= max_consecutive_failures:
-                            batch_error_msg = f"Circuit breaker tripped after {consecutive_failures} consecutive failures on the target website."
-                            logger.error(
-                                "Batch %s: circuit breaker after %s consecutive failures",
-                                batch_id,
-                                consecutive_failures,
-                            )
-                            circuit_event.set()
+                        current_consecutive = consecutive_failures
+                    if current_consecutive >= max_consecutive_failures:
+                        batch_error_msg = f"Circuit breaker tripped after {current_consecutive} consecutive failures on the target website."
+                        logger.error(
+                            "Batch %s: circuit breaker after %s consecutive failures",
+                            batch_id,
+                            current_consecutive,
+                        )
+                        circuit_event.set()
+                    elif current_consecutive > 10 and current_consecutive % 5 == 0:
+                        logger.warning("Batch %s: %s consecutive failures, cooling down for 0.5s", batch_id, current_consecutive)
+                        time.sleep(0.5)
                     return
             finally:
                 release_signup_slot()
@@ -1154,7 +1157,7 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = max(10, int(os.getenv("CONCURRENT_WORKERS", "20")))
+    num_workers = max(4, min(int(os.getenv("CONCURRENT_WORKERS", "8")), 10))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,

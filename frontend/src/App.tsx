@@ -437,17 +437,29 @@ function App() {
                   {batch.status === 'FAILED' && (
                     <div
                       style={{
-                        background: 'rgba(239, 68, 68, 0.12)',
-                        border: '1px solid rgba(239, 68, 68, 0.4)',
+                        background: batch.error_message?.toLowerCase().includes('limit')
+                          ? 'rgba(245, 158, 11, 0.12)'
+                          : 'rgba(239, 68, 68, 0.12)',
+                        border: batch.error_message?.toLowerCase().includes('limit')
+                          ? '1px solid rgba(245, 158, 11, 0.4)'
+                          : '1px solid rgba(239, 68, 68, 0.4)',
                         padding: '12px 16px',
                         borderRadius: '12px',
                         marginBottom: '16px',
-                        color: '#fca5a5',
+                        color: batch.error_message?.toLowerCase().includes('limit') ? '#fcd34d' : '#fca5a5',
                         fontSize: '0.875rem',
                       }}
                     >
-                      <strong style={{ display: 'block', color: '#f87171', marginBottom: '4px' }}>
-                        ⚠️ Referral Limit Reached or Rejected:
+                      <strong
+                        style={{
+                          display: 'block',
+                          color: batch.error_message?.toLowerCase().includes('limit') ? '#fbbf24' : '#f87171',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        {batch.error_message?.toLowerCase().includes('limit')
+                          ? '🎯 Referral Code Limit Reached on Target Site:'
+                          : '⚠️ Task Halted:'}
                       </strong>
                       {batch.error_message ||
                         'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}
@@ -576,7 +588,56 @@ function App() {
                         <td style={{ fontFamily: 'var(--font-mono)' }}>{b.id.slice(0, 8)}</td>
                         <td style={{ fontWeight: 600 }}>{b.referral}</td>
                         <td>
-                          <span className={`status-badge ${b.status}`}>{b.status}</span>
+                          {b.status === 'FAILED' && b.error_message?.toLowerCase().includes('limit') ? (
+                            <div>
+                              <span
+                                className="status-badge"
+                                style={{
+                                  background: 'rgba(245, 158, 11, 0.15)',
+                                  color: '#fbbf24',
+                                  borderColor: 'rgba(245, 158, 11, 0.4)',
+                                }}
+                                title={b.error_message}
+                              >
+                                LIMIT REACHED
+                              </span>
+                              <div
+                                style={{
+                                  fontSize: '0.6875rem',
+                                  color: '#f59e0b',
+                                  marginTop: '3px',
+                                  fontFamily: 'var(--font-mono)',
+                                }}
+                                title={b.error_message}
+                              >
+                                {b.successful} / {b.target} maxed
+                              </div>
+                            </div>
+                          ) : b.status === 'FAILED' ? (
+                            <div>
+                              <span className="status-badge FAILED" title={b.error_message || 'Batch failed'}>
+                                {b.status}
+                              </span>
+                              {b.error_message && (
+                                <div
+                                  style={{
+                                    fontSize: '0.6875rem',
+                                    color: '#f87171',
+                                    marginTop: '3px',
+                                    maxWidth: '140px',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                  title={b.error_message}
+                                >
+                                  {b.error_message}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className={`status-badge ${b.status}`}>{b.status}</span>
+                          )}
                         </td>
                         <td>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '120px' }}>
