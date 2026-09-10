@@ -269,7 +269,7 @@ function App() {
           <section className="hero">
             <p className="eyebrow">CONTROL PANEL / BATCH OPERATIONS</p>
             <h1>Production Automation Hub</h1>
-            <p>Launch referral batches, scale concurrent tasks (10+ simultaneous), and monitor live signups.</p>
+            <p>Launch referral automation and track real-time signup progress.</p>
           </section>
 
           <div className="dashboard-grid">
@@ -297,7 +297,7 @@ function App() {
                 onClick={handleCreateBatch}
                 disabled={loading}
               >
-                {loading ? 'Starting Automation...' : 'Start Automation'}
+                {loading ? 'Launching Task...' : 'Launch Task'}
               </button>
 
               {error && <p className="error-msg" style={{ marginTop: '12px' }}>{error}</p>}
