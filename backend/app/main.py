@@ -1022,8 +1022,15 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id)
             return
         if limit_reached_event.is_set() or circuit_event.is_set():
-            final_status = BatchStatus.COMPLETED.value if batch["successful"] > 0 else BatchStatus.FAILED.value
-            err_msg = batch_error_msg or ("Referral limit reached on target site" if limit_reached_event.is_set() else f"Stopped after {max_consecutive_failures} consecutive failures")
+            # A task ONLY completes when 1000 successful signups happen.
+            # If referral limit is reached or circuit breaker trips before 1000,
+            # it is marked FAILED so it never misleadingly shows COMPLETED.
+            final_status = BatchStatus.FAILED.value
+            err_msg = batch_error_msg or (
+                f"Referral code reached its maximum limit on target site (halted at {batch['successful']}/{batch['target']} signups)"
+                if limit_reached_event.is_set()
+                else f"Halted after {max_consecutive_failures} consecutive failures on target site"
+            )
             update_batch(batch_id, status=final_status, completed_at=now(), error_message=err_msg)
             acknowledge_job(job_id, final_status)
             return
