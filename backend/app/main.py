@@ -148,21 +148,24 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def with_write_retry(fn):
-    """Retry a SQLite write once if another worker holds the lock."""
-    try:
-        return fn()
-    except sqlite3.OperationalError as exc:
-        if "locked" not in str(exc).lower():
-            raise
-        time.sleep(0.05)
-        return fn()
+def with_write_retry(fn, max_attempts: int = 5):
+    """Retry SQLite write operations if another worker holds the lock."""
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(0.02 * (2 ** attempt))
 
 
 def acquire_signup_slot() -> None:
     global _signup_in_flight
     while True:
-        cap = max(1, int(os.getenv("MAX_PARALLEL_SIGNUPS", "32")))
+        cap = max(1, int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")))
         with _signup_slot_lock:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
@@ -202,6 +205,7 @@ def connect() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA busy_timeout = 60000;")
+        connection.execute("PRAGMA synchronous = NORMAL;")
     except Exception:
         pass
     return connection
@@ -213,6 +217,8 @@ def initialize_database() -> None:
         try:
             connection.execute("PRAGMA journal_mode=WAL;")
             connection.execute("PRAGMA busy_timeout=60000;")
+            connection.execute("PRAGMA synchronous=NORMAL;")
+            connection.execute("PRAGMA cache_size=-64000;")
         except Exception as e:
             logger.warning(f"Could not enable WAL mode: {e}")
         connection.execute(
@@ -650,18 +656,34 @@ def claim_unique_phone(batch_id: str) -> str:
                 return candidate
             except sqlite3.IntegrityError:
                 global_used_phones.add(candidate)
-                connection.rollback()
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
                 continue
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if "locked" in msg or "busy" in msg:
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
+                    time.sleep(0.01)
+                    continue
+                raise
 
 
 def mark_phone_status(phone: str, status: str) -> None:
-    try:
+    def _do() -> None:
         with closing(connect()) as connection:
             connection.execute(
                 "UPDATE used_phone_numbers SET status = ? WHERE phone = ?",
                 (status, phone),
             )
             connection.commit()
+
+    try:
+        with_write_retry(_do)
     except Exception as e:
         logger.warning(f"Could not update status for phone {phone}: {e}")
 
@@ -829,12 +851,12 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id, "SKIPPED")
             return
 
-        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "20"))
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "30"))
         concurrency = max(
             1,
             min(
-                int(os.getenv("SIGNUP_CONCURRENCY", "16")),
-                int(os.getenv("MAX_PARALLEL_SIGNUPS", "32")),
+                int(os.getenv("SIGNUP_CONCURRENCY", "50")),
+                int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")),
             ),
         )
         limit_reached_event = threading.Event()
@@ -1094,7 +1116,7 @@ async def rate_limit(request: Request, call_next):
     """Bound local rate limiting; Redis should replace this for multi-instance use."""
     if request.url.path in {"/health", "/healthz", "/ready"}:
         return await call_next(request)
-    limit = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "100"))
+    limit = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "600"))
     client = request.client.host if request.client else "unknown"
     cutoff = time.monotonic() - 60
     with rate_limit_lock:
@@ -1126,7 +1148,7 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = int(os.getenv("CONCURRENT_WORKERS", "10"))
+    num_workers = int(os.getenv("CONCURRENT_WORKERS", "20"))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,
@@ -1212,13 +1234,13 @@ def read_batch(batch_id: str) -> dict:
 def start_batch(batch_id: str) -> dict:
     logger.info(f"Starting batch {batch_id}")
     transition_batch(batch_id, BatchStatus.QUEUED.value, "Only CREATED batches can be started")
-    update_batch(batch_id, started_at=now())
+    batch = update_batch(batch_id, started_at=now())
     pause_events.setdefault(batch_id, threading.Event()).clear()
     stop_events.setdefault(batch_id, threading.Event()).clear()
     create_job(batch_id)
     job_queue.put(batch_id)
     logger.info(f"Batch {batch_id} started successfully")
-    return get_batch(batch_id)
+    return batch
 
 
 @app.post("/batches/{batch_id}/pause", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
