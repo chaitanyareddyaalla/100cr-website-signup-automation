@@ -203,6 +203,8 @@ function App() {
 
   const runningBatchesCount = batchesList.filter((b) => b.status === 'RUNNING').length
   const queuedBatchesCount = batchesList.filter((b) => b.status === 'QUEUED').length
+  const completedBatchesCount = batchesList.filter((b) => b.status === 'COMPLETED').length
+  const totalSuccessCount = batchesList.reduce((sum, b) => sum + (b.successful || 0), 0)
 
   return (
     <div className="app-container">
@@ -270,6 +272,120 @@ function App() {
             <h1>Production Automation Hub</h1>
             <p>Launch referral automation and track real-time signup progress.</p>
           </section>
+
+          {/* Live High-Level Overview Stats Bar */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gap: '16px',
+              marginBottom: '24px',
+            }}
+          >
+            <div className="card" style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div
+                style={{
+                  width: '42px',
+                  height: '42px',
+                  borderRadius: '12px',
+                  background: 'rgba(16, 185, 129, 0.15)',
+                  border: '1px solid rgba(16, 185, 129, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.25rem',
+                }}
+              >
+                ⚡
+              </div>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Tasks Running
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#10b981' }}>
+                  {runningBatchesCount}
+                </div>
+              </div>
+            </div>
+
+            <div className="card" style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div
+                style={{
+                  width: '42px',
+                  height: '42px',
+                  borderRadius: '12px',
+                  background: 'rgba(56, 189, 248, 0.15)',
+                  border: '1px solid rgba(56, 189, 248, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.25rem',
+                }}
+              >
+                ⏳
+              </div>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Tasks Queued
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#38bdf8' }}>
+                  {queuedBatchesCount}
+                </div>
+              </div>
+            </div>
+
+            <div className="card" style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div
+                style={{
+                  width: '42px',
+                  height: '42px',
+                  borderRadius: '12px',
+                  background: 'rgba(99, 102, 241, 0.15)',
+                  border: '1px solid rgba(99, 102, 241, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.25rem',
+                }}
+              >
+                🎯
+              </div>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Total Successful Signups
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#a5b4fc' }}>
+                  {totalSuccessCount.toLocaleString()}
+                </div>
+              </div>
+            </div>
+
+            <div className="card" style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div
+                style={{
+                  width: '42px',
+                  height: '42px',
+                  borderRadius: '12px',
+                  background: 'rgba(168, 85, 247, 0.15)',
+                  border: '1px solid rgba(168, 85, 247, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.25rem',
+                }}
+              >
+                📊
+              </div>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Completed (1000/1000)
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#c084fc' }}>
+                  {completedBatchesCount}
+                </div>
+              </div>
+            </div>
+          </div>
 
           <div className="dashboard-grid">
             {/* Create Batch Card */}
@@ -427,7 +543,7 @@ function App() {
               <div>
                 <p className="card-label" style={{ margin: 0 }}>ACTIVE & QUEUED TASKS ({batchesList.length})</p>
                 <div style={{ fontSize: '0.8125rem', color: 'var(--text-dim)', marginTop: '4px' }}>
-                  Running: <strong style={{ color: '#10b981' }}>{runningBatchesCount}</strong> · Queued: <strong style={{ color: '#38bdf8' }}>{queuedBatchesCount}</strong>
+                  Running: <strong style={{ color: '#10b981' }}>{runningBatchesCount}</strong> · Queued: <strong style={{ color: '#38bdf8' }}>{queuedBatchesCount}</strong> · Completed: <strong style={{ color: '#34d399' }}>{completedBatchesCount}</strong> · Total Signups: <strong style={{ color: '#a5b4fc' }}>{totalSuccessCount.toLocaleString()}</strong>
                 </div>
               </div>
             </div>
