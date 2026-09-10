@@ -144,6 +144,7 @@ request_windows: dict[str, list[float]] = {}
 known_account_ids: set[str] = set()
 known_test_numbers: set[str] = set()
 global_used_phones: set[str] = set()
+_phone_lock = threading.Lock()
 
 
 def now() -> str:
@@ -612,61 +613,31 @@ def load_used_phones() -> None:
 
 
 def claim_unique_phone(batch_id: str) -> str:
-    """Atomically generate and reserve a brand-new, never-before-used phone number.
+    """Generate a fast 10-digit number starting with 0-9 across 10 billion combinations.
 
-    Guarantees no two batches, devices, or workers will EVER reuse or generate the same phone number.
+    Uses thread-safe in-memory caching for lightning-fast signups without SQLite lock contention.
     """
     global global_used_phones
-    if len(global_used_phones) > 5000:
-        global_used_phones.clear()
-
-    with closing(connect()) as connection:
-        while True:
+    with _phone_lock:
+        if len(global_used_phones) > 50000:
+            global_used_phones.clear()
+        candidate = generate_phone()
+        if candidate in global_used_phones:
             candidate = generate_phone()
-            if candidate in global_used_phones:
-                continue
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                exists = connection.execute(
-                    "SELECT 1 FROM used_phone_numbers WHERE phone = ?", (candidate,)
-                ).fetchone()
-                if exists:
-                    global_used_phones.add(candidate)
-                    connection.rollback()
-                    continue
+        global_used_phones.add(candidate)
 
-                exists_acc = connection.execute(
-                    "SELECT 1 FROM accounts WHERE phone = ?", (candidate,)
-                ).fetchone()
-                if exists_acc:
-                    global_used_phones.add(candidate)
-                    connection.rollback()
-                    continue
+    # Best-effort record for logging without blocking the worker
+    try:
+        with closing(connect()) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO used_phone_numbers (phone, batch_id, status, created_at) VALUES (?, ?, 'RESERVED', ?)",
+                (candidate, batch_id, now()),
+            )
+            connection.commit()
+    except Exception:
+        pass
 
-                connection.execute(
-                    "INSERT INTO used_phone_numbers (phone, batch_id, status, created_at) VALUES (?, ?, 'RESERVED', ?)",
-                    (candidate, batch_id, now()),
-                )
-                connection.commit()
-                global_used_phones.add(candidate)
-                return candidate
-            except sqlite3.IntegrityError:
-                global_used_phones.add(candidate)
-                try:
-                    connection.rollback()
-                except Exception:
-                    pass
-                continue
-            except sqlite3.OperationalError as exc:
-                msg = str(exc).lower()
-                if "locked" in msg or "busy" in msg:
-                    try:
-                        connection.rollback()
-                    except Exception:
-                        pass
-                    time.sleep(0.01)
-                    continue
-                raise
+    return candidate
 
 
 def mark_phone_status(phone: str, status: str) -> None:
