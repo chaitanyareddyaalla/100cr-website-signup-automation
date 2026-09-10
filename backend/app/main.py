@@ -1314,7 +1314,12 @@ async def batch_events(batch_id: str) -> StreamingResponse:
                 if queue_list == []:
                     subscribers.pop(batch_id, None)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
 
 
 @app.get("/batches/{batch_id}/accounts", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])

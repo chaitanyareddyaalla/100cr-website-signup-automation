@@ -22,7 +22,6 @@ function App() {
   const [referral, setReferral] = useState('')
   const [batch, setBatch] = useState<Batch | null>(null)
   const [batchesList, setBatchesList] = useState<Batch[]>([])
-  const [autoStart, setAutoStart] = useState(true)
   const [loading, setLoading] = useState(false)
   const [operation, setOperation] = useState<'start' | 'pause' | 'resume' | 'stop' | null>(null)
   const [error, setError] = useState('')
@@ -82,7 +81,7 @@ function App() {
     }
   }, [])
 
-  // SSE & Live Status Updates
+  // Real-time Status Stream + Resilient Polling Fallback
   useEffect(() => {
     const batchId = batch?.id
     if (!batchId) {
@@ -90,16 +89,26 @@ function App() {
       return
     }
 
-    let reconnectTimeout: number | null = null
     let isActive = true
+    let reconnectTimeout: number | null = null
+
+    // Background polling every 2s guarantees continuous metrics even through proxy reconnects
+    const pollInterval = window.setInterval(() => {
+      if (!isActive) return
+      getBatch(batchId)
+        .then((b) => {
+          if (!isActive) return
+          setBatch(b)
+          setConnectionStatus('connected')
+          if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(b.status)) {
+            window.clearInterval(pollInterval)
+          }
+        })
+        .catch(() => {})
+    }, 2000)
 
     function connectToEvents() {
       if (!isActive) return
-
-      // Refetch latest batch state immediately on reconnect/connect
-      getBatch(batchId!)
-        .then((b) => { if (isActive) setBatch(b) })
-        .catch(() => {})
 
       const events = new EventSource(`${API_URL}/batches/${batchId}/events`)
 
@@ -113,13 +122,15 @@ function App() {
         try {
           const nextBatch = JSON.parse(event.data) as Batch
           setBatch(nextBatch)
+          setConnectionStatus('connected')
           if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(nextBatch.status)) {
             isActive = false
             events.close()
+            window.clearInterval(pollInterval)
             setConnectionStatus('disconnected')
           }
         } catch {
-          // ignore parsing error keepalive
+          // ignore keepalive
         }
       }
 
@@ -129,7 +140,6 @@ function App() {
         if (batch?.status && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(batch.status)) {
           return
         }
-        setConnectionStatus('reconnecting')
         reconnectTimeout = window.setTimeout(() => {
           if (isActive) {
             connectToEvents()
@@ -144,36 +154,23 @@ function App() {
 
     return () => {
       isActive = false
-      if (reconnectTimeout) clearTimeout(reconnectTimeout)
+      window.clearInterval(pollInterval)
+      if (reconnectTimeout) window.clearTimeout(reconnectTimeout)
       if (events) events.close()
     }
-  }, [batch?.id, batch?.status])
+  }, [batch?.id])
 
-  async function handleCreateBatch(count: number = 1) {
-    const rawCodes = referral
-      .split(/[\n,;\s]+/)
-      .map((c) => c.trim())
-      .filter(Boolean)
-
-    if (rawCodes.length === 0) {
-      setError('Please enter at least one referral code.')
+  async function handleCreateBatch() {
+    const code = referral.trim()
+    if (!code) {
+      setError('Please enter a referral code first.')
       return
     }
     setError('')
     setLoading(true)
     try {
-      let codesToRun: string[] = []
-      if (rawCodes.length > 1) {
-        // If user provided multiple referral codes, launch one task per code!
-        codesToRun = rawCodes
-      } else {
-        // If user provided 1 code, run 'count' tasks with the exact same referral code
-        codesToRun = Array(count).fill(rawCodes[0])
-      }
-
-      const promises = codesToRun.map((code) => createBatch(code, autoStart))
-      const results = await Promise.all(promises)
-      if (results.length > 0) setBatch(results[0])
+      const created = await createBatch(code, true)
+      setBatch(created)
       const list = await listBatches(30)
       setBatchesList(list)
     } catch {
@@ -207,7 +204,6 @@ function App() {
 
   const runningBatchesCount = batchesList.filter((b) => b.status === 'RUNNING').length
   const queuedBatchesCount = batchesList.filter((b) => b.status === 'QUEUED').length
-  const detectedCodes = referral.split(/[\n,;\s]+/).map((c) => c.trim()).filter(Boolean)
 
   return (
     <div className="app-container">
@@ -281,67 +277,28 @@ function App() {
             <div className="card">
               <p className="card-label">01 / NEW BATCH</p>
               <div className="form-group">
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                  <label htmlFor="referral-input" style={{ margin: 0 }}>Referral Code(s)</label>
-                  {detectedCodes.length > 0 && (
-                    <span style={{ fontSize: '0.75rem', color: detectedCodes.length >= 10 ? '#10b981' : '#38bdf8', fontWeight: 600 }}>
-                      {detectedCodes.length} {detectedCodes.length === 1 ? 'referral' : 'referrals'} detected
-                    </span>
-                  )}
-                </div>
+                <label htmlFor="referral-input">Referral Code</label>
                 <div className="input-row">
-                  <textarea
+                  <input
                     id="referral-input"
                     className="input-field"
-                    rows={3}
                     value={referral}
                     onChange={(e) => setReferral(e.target.value)}
-                    placeholder="Enter 1 referral code or paste 10 codes (separated by commas or lines)"
-                    style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: '0.875rem' }}
+                    placeholder="e.g. 100CRCLUBW9PKQ69N"
+                    maxLength={100}
                   />
                 </div>
               </div>
 
-              <div style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <input
-                  type="checkbox"
-                  id="auto-start-toggle"
-                  checked={autoStart}
-                  onChange={(e) => setAutoStart(e.target.checked)}
-                  style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
-                />
-                <label htmlFor="auto-start-toggle" style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}>
-                  Auto-start tasks immediately upon creation
-                </label>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <button
-                  type="button"
-                  className="btn-primary"
-                  style={{ width: '100%' }}
-                  onClick={() => handleCreateBatch(1)}
-                  disabled={loading}
-                >
-                  {loading
-                    ? 'Launching Tasks...'
-                    : detectedCodes.length > 1
-                    ? `Launch ${detectedCodes.length} Tasks (${detectedCodes.length} Referrals)`
-                    : 'Launch 1 Task'}
-                </button>
-
-                {detectedCodes.length <= 1 && (
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    style={{ width: '100%', borderColor: 'rgba(59, 130, 246, 0.4)', color: '#38bdf8' }}
-                    onClick={() => handleCreateBatch(10)}
-                    disabled={loading}
-                  >
-                    {loading ? 'Launching 10 Tasks...' : '⚡ Launch 10 Tasks (Same Referral)'}
-                  </button>
-                )}
-              </div>
+              <button
+                type="button"
+                className="btn-primary"
+                style={{ width: '100%', marginTop: '8px' }}
+                onClick={handleCreateBatch}
+                disabled={loading}
+              >
+                {loading ? 'Starting Automation...' : 'Start Automation'}
+              </button>
 
               {error && <p className="error-msg" style={{ marginTop: '12px' }}>{error}</p>}
             </div>
