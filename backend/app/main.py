@@ -111,9 +111,9 @@ class BatchResponse(BaseModel):
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
 MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
-RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
-MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "2"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.0"))
+RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "1.0"))
+MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "0.0"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
