@@ -50,7 +50,7 @@ def _http_pool():
             _HTTP_POOL = urllib3.PoolManager(
                 num_pools=8,
                 maxsize=maxsize,
-                timeout=urllib3.Timeout(connect=10.0, read=15.0),
+                timeout=urllib3.Timeout(connect=3.0, read=8.0),
                 retries=False,
             )
         return _HTTP_POOL

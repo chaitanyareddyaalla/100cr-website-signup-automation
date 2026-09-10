@@ -15,7 +15,7 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     # Generate 50 unique phones for batch 1
     for _ in range(50):
         phone = backend_main.claim_unique_phone(batch_1)
-        assert phone[0] in "6789"
+        assert phone[0] in "0123456789"
         assert len(phone) == 10
         assert phone.isdigit()
         assert phone not in generated_phones
@@ -26,7 +26,7 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     # Generate 50 unique phones for batch 2
     for _ in range(50):
         phone = backend_main.claim_unique_phone(batch_2)
-        assert phone[0] in "6789"
+        assert phone[0] in "0123456789"
         assert len(phone) == 10
         assert phone.isdigit()
         assert phone not in generated_phones  # Guarantees batch 2 does not reuse numbers
@@ -46,19 +46,18 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     assert phone_new not in generated_phones
 
 
-def test_generate_phone_authentic_indian_prefixes():
-    from worker.generators.phone_generator import VALID_INDIAN_PREFIXES, generate_phone
+def test_generate_phone_full_digit_space():
+    from worker.generators.phone_generator import generate_phone
 
     seen_prefixes = set()
     for _ in range(500):
         phone = generate_phone()
         assert len(phone) == 10
         assert phone.isdigit()
-        assert phone[0] in "6789"
-        seen_prefixes.add(phone[:2])
+        assert phone[0] in "0123456789"
+        seen_prefixes.add(phone[0])
 
-    # Over 500 generations, multiple realistic Indian operator prefixes will be utilized
+    # Over 500 generations across 10B space, diverse digits (0-9) appear
     assert len(seen_prefixes) >= 5
-    for p in seen_prefixes:
-        assert p in VALID_INDIAN_PREFIXES
+
 

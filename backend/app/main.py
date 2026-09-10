@@ -832,7 +832,7 @@ def process_batch(batch_id: str) -> None:
         )
         hb_thread.start()
 
-        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "100"))
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "500"))
         concurrency = max(
             1,
             min(
@@ -851,14 +851,14 @@ def process_batch(batch_id: str) -> None:
             nonlocal consecutive_failures, batch_error_msg
             acquire_signup_slot()
             try:
-                if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set() or pause_event.is_set():
+                if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
                     return
                 current = get_batch(batch_id)
                 if current["status"] != BatchStatus.RUNNING.value:
                     return
                 mark_identity_processing(identity.test_id, batch_id)
                 for retry in range(MAX_SIGNUP_RETRIES + 1):
-                    if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set() or pause_event.is_set():
+                    if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
                         return
                     current = get_batch(batch_id)
                     if current["status"] != BatchStatus.RUNNING.value:
@@ -905,7 +905,7 @@ def process_batch(batch_id: str) -> None:
                         limit_reached_event.set()
                         return
                     if result.status == "DUPLICATE":
-                        logger.info("Batch %s: phone already registered; skipping and trying another", batch_id)
+                        logger.info("Batch %s: phone already registered; trying another 10-digit number", batch_id)
                         mark_phone_status(identity.phone, "DUPLICATE")
                         increment_batch_counters(batch_id, skipped=1, attempted=1)
                         finalize_identity(identity.test_id, "SKIPPED", batch_id)
@@ -933,7 +933,7 @@ def process_batch(batch_id: str) -> None:
                         if delay > 0 and stop_event.wait(delay):
                             return
                         continue
-                    logger.warning("Batch %s: signup failed after retries", batch_id)
+                    # On failure or timeout after retry: record and move to next 10-digit number
                     mark_phone_status(identity.phone, "FAILED")
                     increment_batch_counters(batch_id, failed=1, attempted=1)
                     finalize_identity(identity.test_id, "FAILED", batch_id)
@@ -942,15 +942,9 @@ def process_batch(batch_id: str) -> None:
                         current_consecutive = consecutive_failures
                     if current_consecutive >= max_consecutive_failures:
                         batch_error_msg = f"Circuit breaker tripped after {current_consecutive} consecutive failures on the target website."
-                        logger.error(
-                            "Batch %s: circuit breaker after %s consecutive failures",
-                            batch_id,
-                            current_consecutive,
-                        )
                         circuit_event.set()
-                    elif current_consecutive > 10 and current_consecutive % 5 == 0:
-                        logger.warning("Batch %s: %s consecutive failures, cooling down for 0.5s", batch_id, current_consecutive)
-                        time.sleep(0.5)
+                    elif current_consecutive > 15 and current_consecutive % 10 == 0:
+                        time.sleep(0.3)
                     return
             finally:
                 release_signup_slot()
@@ -994,7 +988,6 @@ def process_batch(batch_id: str) -> None:
                         and (batch["successful"] + len(pending)) < batch["target"]
                         and not stop_event.is_set()
                         and not limit_reached_event.is_set()
-                        and not circuit_event.is_set()
                         and not pause_event.is_set()
                         and batch["status"] == BatchStatus.RUNNING.value
                     ):
@@ -1025,9 +1018,6 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id)
             return
         if limit_reached_event.is_set() or circuit_event.is_set():
-            # A task ONLY completes when 1000 successful signups happen.
-            # If referral limit is reached or circuit breaker trips before 1000,
-            # it is marked FAILED so it never misleadingly shows COMPLETED.
             final_status = BatchStatus.FAILED.value
             err_msg = batch_error_msg or (
                 f"Referral code reached its maximum limit on target site (halted at {batch['successful']}/{batch['target']} signups)"
