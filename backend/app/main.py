@@ -75,12 +75,13 @@ ALLOWED_STATE_TRANSITIONS: dict[str, set[str]] = {
         BatchStatus.PAUSED.value,
         BatchStatus.STOPPING.value,
         BatchStatus.COMPLETED.value,
+        BatchStatus.FAILED.value,
     },
     BatchStatus.PAUSED.value: {
         BatchStatus.RUNNING.value,
         BatchStatus.STOPPING.value,
     },
-    BatchStatus.STOPPING.value: {BatchStatus.CANCELLED.value},
+    BatchStatus.STOPPING.value: {BatchStatus.CANCELLED.value, BatchStatus.STOPPING.value},
 }
 
 
@@ -609,16 +610,15 @@ def load_used_phones() -> None:
 
 
 def claim_unique_phone(batch_id: str) -> str:
-    """Generate a fast 10-digit number starting with 0-9 across 10 billion combinations.
-
-    Uses thread-safe in-memory caching for lightning-fast signups without SQLite lock contention.
-    """
+    """Generate a fast, unique 10-digit phone number avoiding collisions."""
     global global_used_phones
     with _phone_lock:
-        if len(global_used_phones) > 50000:
+        if len(global_used_phones) > 100000:
             global_used_phones.clear()
         candidate = generate_phone()
-        if candidate in global_used_phones:
+        for _ in range(50):
+            if candidate not in global_used_phones:
+                break
             candidate = generate_phone()
         global_used_phones.add(candidate)
 
@@ -852,14 +852,14 @@ def process_batch(batch_id: str) -> None:
             nonlocal consecutive_failures, batch_error_msg
             acquire_signup_slot()
             try:
-                if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set():
+                if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set() or pause_event.is_set():
                     return
                 current = get_batch(batch_id)
                 if current["status"] != BatchStatus.RUNNING.value:
                     return
                 mark_identity_processing(identity.test_id, batch_id)
                 for retry in range(MAX_SIGNUP_RETRIES + 1):
-                    if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set():
+                    if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set() or pause_event.is_set():
                         return
                     current = get_batch(batch_id)
                     if current["status"] != BatchStatus.RUNNING.value:
@@ -896,6 +896,12 @@ def process_batch(batch_id: str) -> None:
                     if result.status == "LIMIT_REACHED":
                         batch_error_msg = getattr(result, "error", "") or "This referral code has reached its maximum limit on the target website."
                         logger.warning("Batch %s: referral reached maximum limit; stopping new signups", batch_id)
+                        mark_phone_status(identity.phone, "FAILED")
+                        limit_reached_event.set()
+                        return
+                    if result.status == "INVALID_REFERRAL":
+                        batch_error_msg = getattr(result, "error", "") or "Invalid referral code. Please check your referral code."
+                        logger.warning("Batch %s: invalid referral code; stopping batch", batch_id)
                         mark_phone_status(identity.phone, "FAILED")
                         limit_reached_event.set()
                         return
@@ -969,11 +975,14 @@ def process_batch(batch_id: str) -> None:
                         break
                     if limit_reached_event.is_set() or circuit_event.is_set():
                         break
-                    if stop_event.is_set() or batch["status"] == BatchStatus.STOPPING.value:
+                    if stop_event.is_set() or batch["status"] in (BatchStatus.STOPPING.value, BatchStatus.CANCELLED.value):
                         break
-                    if batch["status"] == BatchStatus.PAUSED.value:
-                        pause_event.wait(0.05)
-                        heartbeat_job(job_id)
+                    if batch["status"] == BatchStatus.PAUSED.value or pause_event.is_set():
+                        while (batch["status"] == BatchStatus.PAUSED.value or pause_event.is_set()) and not stop_event.is_set():
+                            if stop_event.wait(0.02):
+                                break
+                            heartbeat_job(job_id)
+                            batch = get_batch(batch_id)
                         continue
                     if batch["status"] != BatchStatus.RUNNING.value:
                         break
@@ -983,17 +992,15 @@ def process_batch(batch_id: str) -> None:
                         and not stop_event.is_set()
                         and not limit_reached_event.is_set()
                         and not circuit_event.is_set()
+                        and not pause_event.is_set()
+                        and batch["status"] == BatchStatus.RUNNING.value
                     ):
                         identity = _build_identity(batch_id, batch.get("referral", ""))
                         pending.add(pool.submit(run_one, identity))
-                        batch = get_batch(batch_id)
             finally:
                 if pending:
-                    done, still = wait(pending, timeout=120)
-                    for finished in done:
-                        exc = finished.exception()
-                        if exc is not None:
-                            fatal.append(exc)
+                    wait_time = 0.5 if (stop_event.is_set() or batch.get("status") == BatchStatus.STOPPING.value) else 5.0
+                    done, still = wait(pending, timeout=wait_time)
                     pending = still
                     heartbeat_job(job_id)
 
@@ -1001,8 +1008,8 @@ def process_batch(batch_id: str) -> None:
             raise fatal[0]
 
         batch = get_batch(batch_id)
-        if stop_event.is_set() or batch["status"] == BatchStatus.STOPPING.value:
-            logger.info(f"Batch {batch_id} is being stopped")
+        if stop_event.is_set() or batch["status"] in (BatchStatus.STOPPING.value, BatchStatus.CANCELLED.value):
+            logger.info(f"Batch {batch_id} is stopped")
             if batch["status"] == BatchStatus.PAUSED.value:
                 transition_batch(batch_id, BatchStatus.STOPPING.value, "Only paused batches can stop")
             if get_batch(batch_id)["status"] == BatchStatus.STOPPING.value:
@@ -1020,6 +1027,7 @@ def process_batch(batch_id: str) -> None:
             update_batch(batch_id, status=final_status, completed_at=now(), error_message=err_msg)
             acknowledge_job(job_id, final_status)
             return
+
         if batch["status"] != BatchStatus.RUNNING.value:
             acknowledge_job(job_id, "STOPPED")
             return

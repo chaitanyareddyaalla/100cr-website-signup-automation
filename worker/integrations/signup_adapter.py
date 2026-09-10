@@ -32,6 +32,12 @@ _LIMIT_MARKERS = (
     "referral code has reached",
     "limit reached",
 )
+_INVALID_REFERRAL_MARKERS = (
+    "invalid referral",
+    "referral code not found",
+    "referral not found",
+    "invalid code",
+)
 
 
 def _http_pool():
@@ -117,6 +123,20 @@ class AuthorizedPlaywrightAdapter:
             return SignupResult.limit_reached(
                 identity.account_id,
                 error=body or "Referral code maximum limit reached",
+                phone=identity.phone,
+            )
+        if any(marker in body_lower for marker in _INVALID_REFERRAL_MARKERS):
+            return SignupResult(
+                account_id=identity.account_id,
+                status="INVALID_REFERRAL",
+                error=body or "Invalid referral code",
+                phone=identity.phone,
+            )
+        if 500 <= http_status < 600:
+            return SignupResult(
+                account_id=identity.account_id,
+                status="SERVER_ERROR",
+                error=body or f"Server error {http_status}",
                 phone=identity.phone,
             )
         return SignupResult.failure(identity.account_id, error=body or f"HTTP {http_status}", phone=identity.phone)

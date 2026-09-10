@@ -200,7 +200,6 @@ function App() {
   }
 
   const progress = batch ? Math.min(100, Math.max(0, batch.progress_percent ?? 0)) : 0
-  const isRunning = batch?.status === 'RUNNING' || batch?.status === 'QUEUED' || batch?.status === 'PAUSED'
 
   const runningBatchesCount = batchesList.filter((b) => b.status === 'RUNNING').length
   const queuedBatchesCount = batchesList.filter((b) => b.status === 'QUEUED').length
@@ -402,14 +401,14 @@ function App() {
                         {operation === 'resume' ? 'Resuming...' : 'Resume'}
                       </button>
                     )}
-                    {isRunning && (
+                    {(batch.status === 'RUNNING' || batch.status === 'PAUSED' || batch.status === 'QUEUED' || batch.status === 'STOPPING') && (
                       <button
                         type="button"
                         className="btn-danger"
                         onClick={() => handleControl('stop')}
                         disabled={operation !== null}
                       >
-                        {operation === 'stop' ? 'Stopping...' : 'Stop'}
+                        {operation === 'stop' || batch.status === 'STOPPING' ? 'Stopping...' : 'Stop'}
                       </button>
                     )}
                   </div>
@@ -491,6 +490,46 @@ function App() {
                               {batch?.id === b.id ? 'Monitoring' : 'Monitor'}
                             </button>
                             {b.status === 'RUNNING' && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn-secondary"
+                                  style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                  onClick={() => handleControl('pause', b.id)}
+                                >
+                                  Pause
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-danger"
+                                  style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                  onClick={() => handleControl('stop', b.id)}
+                                >
+                                  Stop
+                                </button>
+                              </>
+                            )}
+                            {b.status === 'PAUSED' && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn-primary"
+                                  style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                  onClick={() => handleControl('resume', b.id)}
+                                >
+                                  Resume
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-danger"
+                                  style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                                  onClick={() => handleControl('stop', b.id)}
+                                >
+                                  Stop
+                                </button>
+                              </>
+                            )}
+                            {(b.status === 'QUEUED' || b.status === 'STOPPING') && (
                               <button
                                 type="button"
                                 className="btn-danger"
