@@ -150,17 +150,28 @@ function App() {
   }, [batch?.id, batch?.status])
 
   async function handleCreateBatch(count: number = 1) {
-    if (!referral.trim()) {
-      setError('Please enter a referral code first.')
+    const rawCodes = referral
+      .split(/[\n,;\s]+/)
+      .map((c) => c.trim())
+      .filter(Boolean)
+
+    if (rawCodes.length === 0) {
+      setError('Please enter at least one referral code.')
       return
     }
     setError('')
     setLoading(true)
     try {
-      const promises = Array.from({ length: count }, (_, i) => {
-        const refCode = count > 1 ? `${referral.trim()}-${i + 1}` : referral.trim()
-        return createBatch(refCode, autoStart)
-      })
+      let codesToRun: string[] = []
+      if (rawCodes.length > 1) {
+        // If user provided multiple referral codes, launch one task per code!
+        codesToRun = rawCodes
+      } else {
+        // If user provided 1 code, run 'count' tasks with the exact same referral code
+        codesToRun = Array(count).fill(rawCodes[0])
+      }
+
+      const promises = codesToRun.map((code) => createBatch(code, autoStart))
       const results = await Promise.all(promises)
       if (results.length > 0) setBatch(results[0])
       const list = await listBatches(30)
@@ -196,6 +207,7 @@ function App() {
 
   const runningBatchesCount = batchesList.filter((b) => b.status === 'RUNNING').length
   const queuedBatchesCount = batchesList.filter((b) => b.status === 'QUEUED').length
+  const detectedCodes = referral.split(/[\n,;\s]+/).map((c) => c.trim()).filter(Boolean)
 
   return (
     <div className="app-container">
@@ -269,15 +281,23 @@ function App() {
             <div className="card">
               <p className="card-label">01 / NEW BATCH</p>
               <div className="form-group">
-                <label htmlFor="referral-input">Referral Code</label>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                  <label htmlFor="referral-input" style={{ margin: 0 }}>Referral Code(s)</label>
+                  {detectedCodes.length > 0 && (
+                    <span style={{ fontSize: '0.75rem', color: detectedCodes.length >= 10 ? '#10b981' : '#38bdf8', fontWeight: 600 }}>
+                      {detectedCodes.length} {detectedCodes.length === 1 ? 'referral' : 'referrals'} detected
+                    </span>
+                  )}
+                </div>
                 <div className="input-row">
-                  <input
+                  <textarea
                     id="referral-input"
                     className="input-field"
+                    rows={3}
                     value={referral}
                     onChange={(e) => setReferral(e.target.value)}
-                    placeholder="e.g. 100CRCLUBW9PKQ69N"
-                    maxLength={120}
+                    placeholder="Enter 1 referral code or paste 10 codes (separated by commas or lines)"
+                    style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: '0.875rem' }}
                   />
                 </div>
               </div>
@@ -303,18 +323,24 @@ function App() {
                   onClick={() => handleCreateBatch(1)}
                   disabled={loading}
                 >
-                  {loading ? 'Queueing Task...' : 'Launch 1 Task'}
+                  {loading
+                    ? 'Launching Tasks...'
+                    : detectedCodes.length > 1
+                    ? `Launch ${detectedCodes.length} Tasks (${detectedCodes.length} Referrals)`
+                    : 'Launch 1 Task'}
                 </button>
 
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  style={{ width: '100%', borderColor: 'rgba(59, 130, 246, 0.4)', color: '#38bdf8' }}
-                  onClick={() => handleCreateBatch(10)}
-                  disabled={loading}
-                >
-                  {loading ? 'Queueing Tasks...' : '⚡ Launch 10 Tasks At Once'}
-                </button>
+                {detectedCodes.length <= 1 && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ width: '100%', borderColor: 'rgba(59, 130, 246, 0.4)', color: '#38bdf8' }}
+                    onClick={() => handleCreateBatch(10)}
+                    disabled={loading}
+                  >
+                    {loading ? 'Launching 10 Tasks...' : '⚡ Launch 10 Tasks (Same Referral)'}
+                  </button>
+                )}
               </div>
 
               {error && <p className="error-msg" style={{ marginTop: '12px' }}>{error}</p>}
