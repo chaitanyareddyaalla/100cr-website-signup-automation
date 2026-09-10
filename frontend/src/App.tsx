@@ -157,13 +157,12 @@ function App() {
     setError('')
     setLoading(true)
     try {
-      let first: Batch | null = null
-      for (let i = 0; i < count; i++) {
+      const promises = Array.from({ length: count }, (_, i) => {
         const refCode = count > 1 ? `${referral.trim()}-${i + 1}` : referral.trim()
-        const created = await createBatch(refCode, autoStart)
-        if (i === 0) first = created
-      }
-      if (first) setBatch(first)
+        return createBatch(refCode, autoStart)
+      })
+      const results = await Promise.all(promises)
+      if (results.length > 0) setBatch(results[0])
       const list = await listBatches(30)
       setBatchesList(list)
     } catch {

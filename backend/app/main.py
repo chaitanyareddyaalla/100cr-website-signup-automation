@@ -284,18 +284,14 @@ def initialize_database() -> None:
 
 def get_batch(batch_id: str) -> dict:
     with closing(connect()) as connection:
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
-        err_col = ", error_message" if "error_message" in columns else ""
         row = connection.execute(
-            f"SELECT id, referral, target, successful, failed, skipped, attempted, retries, status, "
-            f"created_at, started_at, completed_at{err_col} FROM batches WHERE id = ?",
+            "SELECT id, referral, target, successful, failed, skipped, attempted, retries, status, "
+            "created_at, started_at, completed_at, error_message FROM batches WHERE id = ?",
             (batch_id,),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Batch not found")
     batch = dict(row)
-    if "error_message" not in batch:
-        batch["error_message"] = None
     progress = calculate_batch_progress(batch)
     batch.update(progress)
     return batch
@@ -1218,17 +1214,23 @@ def seed_identities(data: SeedIdentitiesRequest) -> dict[str, object]:
 @app.get("/batches", response_model=list[BatchResponse], dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
 def list_batches(limit: int = 50, status: str | None = None) -> list[dict]:
     with closing(connect()) as connection:
+        query = (
+            "SELECT id, referral, target, successful, failed, skipped, attempted, retries, status, "
+            "created_at, started_at, completed_at, error_message FROM batches "
+        )
         if status:
-            rows = connection.execute(
-                "SELECT id FROM batches WHERE status = ? ORDER BY rowid DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
+            query += "WHERE status = ? ORDER BY rowid DESC LIMIT ?"
+            rows = connection.execute(query, (status, limit)).fetchall()
         else:
-            rows = connection.execute(
-                "SELECT id FROM batches ORDER BY rowid DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-    return [get_batch(row["id"]) for row in rows]
+            query += "ORDER BY rowid DESC LIMIT ?"
+            rows = connection.execute(query, (limit,)).fetchall()
+    results = []
+    for r in rows:
+        b = dict(r)
+        b.update(calculate_batch_progress(b))
+        results.append(b)
+    return results
+
 
 
 @app.post("/batches", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
