@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from queue import Empty
@@ -10,16 +11,22 @@ from fastapi.testclient import TestClient
 import backend.app.main as backend_main
 import worker.integrations.google_sheets as google_sheets
 from backend.app.main import app, update_batch
-from worker.generators.test_data import TestIdentity
 
 
 @pytest.fixture(autouse=True)
 def isolate_worker_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOMATION_MODE", "mock")
+    monkeypatch.setenv("SIGNUP_CONCURRENCY", "1")
+    monkeypatch.setenv("MAX_PARALLEL_SIGNUPS", "1")
+    monkeypatch.setenv("MAX_CONSECUTIVE_FAILURES", "20")
     monkeypatch.setattr(backend_main, "DATABASE_PATH", tmp_path / "batches.db")
+    monkeypatch.setattr(backend_main, "RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(backend_main, "_signup_in_flight", 0)
     backend_main.pause_events.clear()
     backend_main.stop_events.clear()
     backend_main.known_account_ids.clear()
     backend_main.known_test_numbers.clear()
+    backend_main.global_used_phones.clear()
     while True:
         try:
             backend_main.job_queue.get_nowait()
@@ -69,7 +76,7 @@ def test_batch_lifecycle_controls() -> None:
         batch_id = batch["id"]
         assert batch["status"] == "CREATED"
         started = client.post(f"/batches/{batch_id}/start").json()
-        assert started["status"] == "QUEUED"
+        assert started["status"] in ("QUEUED", "RUNNING")
         paused = client.post(f"/batches/{batch_id}/pause")
         assert paused.status_code in (200, 409)
         stopped = client.post(f"/batches/{batch_id}/stop")
@@ -282,15 +289,12 @@ def test_worker_retries_transient_failure(monkeypatch) -> None:
 
 
 def test_worker_counts_failure_after_retries_and_continues(monkeypatch) -> None:
-    identities = [
-        TestIdentity("FAILED", "Failed", "failed"),
-        TestIdentity("SUCCESS", "Success", "success"),
-    ]
-    monkeypatch.setattr(backend_main, "generate_identity", lambda index: identities[min(index, 1)])
+    phones = iter(["FAILED_PHONE", "SUCCESS_PHONE"])
+    monkeypatch.setattr(backend_main, "claim_unique_phone", lambda batch_id: next(phones))
     monkeypatch.setattr(
         backend_main,
         "run_mock_signup",
-        lambda identity: type("Result", (), {"status": "FAILURE" if identity.account_id == "FAILED" else "SUCCESS", "account_id": identity.account_id})(),
+        lambda identity: type("Result", (), {"status": "FAILURE" if identity.account_id == "FAILED_PHONE" else "SUCCESS", "account_id": identity.account_id})(),
     )
     batch = queued_batch(1)
     backend_main.process_batch(batch["id"])
@@ -308,8 +312,8 @@ def test_duplicate_result_is_not_retried_or_counted(monkeypatch) -> None:
         status = "DUPLICATE" if identity.account_id == "DUPLICATE" else "SUCCESS"
         return type("Result", (), {"status": status, "account_id": identity.account_id})()
 
-    identities = [TestIdentity("DUPLICATE", "Duplicate", "duplicate"), TestIdentity("UNIQUE", "Unique", "unique")]
-    monkeypatch.setattr(backend_main, "generate_identity", lambda index: identities[min(index, 1)])
+    phones = iter(["DUPLICATE", "UNIQUE"])
+    monkeypatch.setattr(backend_main, "claim_unique_phone", lambda batch_id: next(phones))
     monkeypatch.setattr(backend_main, "run_mock_signup", signup)
     batch = queued_batch(1)
     backend_main.process_batch(batch["id"])
@@ -329,29 +333,35 @@ def test_worker_cleans_event_flags(monkeypatch) -> None:
 
 
 def test_duplicate_number_is_skipped(monkeypatch) -> None:
-    identities = [
-        TestIdentity("DUPLICATE", "Duplicate", "duplicate"),
-        TestIdentity("UNIQUE", "Unique", "unique"),
-    ]
-    monkeypatch.setattr(backend_main, "generate_identity", lambda index: identities[min(index, 1)])
-    backend_main.known_account_ids.add("DUPLICATE")
+    phones = iter(["DUPLICATE", "UNIQUE"])
+    monkeypatch.setattr(backend_main, "claim_unique_phone", lambda batch_id: next(phones))
+
+    def signup(identity):
+        status = "DUPLICATE" if identity.account_id == "DUPLICATE" else "SUCCESS"
+        return type("Result", (), {"status": status, "account_id": identity.account_id, "error": "", "timestamp": ""})()
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", signup)
     batch = queued_batch(1)
     backend_main.process_batch(batch["id"])
     assert backend_main.get_batch(batch["id"])["successful"] == 1
+    assert backend_main.get_batch(batch["id"])["skipped"] == 1
 
 
 def test_duplicate_does_not_count_as_success(monkeypatch) -> None:
-    identities = [
-        TestIdentity("DUPLICATE", "Duplicate", "duplicate"),
-        TestIdentity("UNIQUE", "Unique", "unique"),
-    ]
-    monkeypatch.setattr(backend_main, "generate_identity", lambda index: identities[min(index, 1)])
-    backend_main.known_test_numbers.add("duplicate")
+    phones = iter(["duplicate", "unique"])
+    monkeypatch.setattr(backend_main, "claim_unique_phone", lambda batch_id: next(phones))
+
+    def signup(identity):
+        status = "DUPLICATE" if identity.account_id == "duplicate" else "SUCCESS"
+        return type("Result", (), {"status": status, "account_id": identity.account_id, "error": "", "timestamp": ""})()
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", signup)
     batch = queued_batch(1)
     backend_main.process_batch(batch["id"])
     result = backend_main.get_batch(batch["id"])
     assert result["successful"] == 1
     assert result["failed"] == 0
+    assert result["skipped"] == 1
 
 
 def test_duplicate_queue_entries_are_claimed_once(monkeypatch) -> None:
@@ -480,12 +490,18 @@ def test_progress_metrics_are_consistent() -> None:
     assert progress["progress_percent"] == 30
 
 
-def test_retry_policy_uses_backoff_and_blocks_duplicates() -> None:
-    assert backend_main.calculate_retry_delay(1) == 2.0
-    assert backend_main.calculate_retry_delay(2) == 4.0
-    assert backend_main.calculate_retry_delay(3) == 8.0
+def test_retry_policy_uses_backoff_and_blocks_duplicates(monkeypatch) -> None:
+    monkeypatch.setattr(backend_main, "RETRY_DELAY_SECONDS", 0.5)
+    monkeypatch.setattr(backend_main, "RETRY_BACKOFF_MULTIPLIER", 2.0)
+    monkeypatch.setattr(backend_main, "MAX_RETRY_DELAY_SECONDS", 2.0)
+    assert backend_main.calculate_retry_delay(1) == 0.5
+    assert backend_main.calculate_retry_delay(2) == 1.0
+    assert backend_main.calculate_retry_delay(3) == 2.0
+    assert backend_main.calculate_retry_delay(4) == 2.0
     assert backend_main.should_retry("FAILURE", "RUNNING", 1) is True
+    assert backend_main.should_retry("TIMEOUT", "RUNNING", 1) is True
     assert backend_main.should_retry("DUPLICATE", "RUNNING", 1) is False
+    assert backend_main.should_retry("LIMIT_REACHED", "RUNNING", 1) is False
     assert backend_main.should_retry("FAILURE", "CANCELLED", 1) is False
 
 
@@ -617,3 +633,100 @@ def test_workers_endpoint() -> None:
     assert "active_worker_id" in data
     assert "queue_size" in data
     assert "recent_jobs" in data
+
+
+def test_worker_terminates_immediately_on_limit_reached(monkeypatch) -> None:
+    from worker.automation.signup_flow import SignupResult
+
+    attempt_count = 0
+
+    def mock_signup(identity):
+        nonlocal attempt_count
+        attempt_count += 1
+        return SignupResult.limit_reached(identity.account_id, "This referral code has reached its maximum limit")
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", mock_signup)
+    batch = queued_batch(100)
+    backend_main.process_batch(batch["id"])
+
+    result = backend_main.get_batch(batch["id"])
+    # Batch terminates immediately and does not retry 100 times
+    assert result["status"] in ("COMPLETED", "FAILED")
+    assert attempt_count == 1
+
+
+def test_worker_circuit_breaker_triggers_after_consecutive_failures(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_CONSECUTIVE_FAILURES", "5")
+    monkeypatch.setattr(backend_main, "RETRY_DELAY_SECONDS", 0.0)
+    from worker.automation.signup_flow import SignupResult
+
+    attempt_count = 0
+
+    def mock_signup(identity):
+        nonlocal attempt_count
+        attempt_count += 1
+        return SignupResult.failure(identity.account_id, "Network failure")
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", mock_signup)
+    batch = queued_batch(100)
+    backend_main.process_batch(batch["id"])
+
+    result = backend_main.get_batch(batch["id"])
+    assert result["status"] in ("COMPLETED", "FAILED")
+    assert result["failed"] == 5
+
+
+def test_parallel_signups_do_not_overshoot_target(monkeypatch) -> None:
+    monkeypatch.setenv("SIGNUP_CONCURRENCY", "8")
+    monkeypatch.setenv("MAX_PARALLEL_SIGNUPS", "8")
+    monkeypatch.setattr(
+        backend_main,
+        "run_mock_signup",
+        lambda identity: type("Result", (), {"status": "SUCCESS", "account_id": identity.account_id, "error": "", "timestamp": ""})(),
+    )
+    batch = queued_batch(3)
+    backend_main.process_batch(batch["id"])
+    result = backend_main.get_batch(batch["id"])
+    assert result["status"] == "COMPLETED"
+    assert result["successful"] == 3
+
+
+def test_already_registered_numbers_are_skipped_until_target(monkeypatch) -> None:
+    phones = iter(["TAKEN1", "TAKEN2", "TAKEN3", "FRESH"])
+    monkeypatch.setattr(backend_main, "claim_unique_phone", lambda batch_id: next(phones))
+
+    def signup(identity):
+        if identity.account_id.startswith("TAKEN"):
+            return type("Result", (), {"status": "DUPLICATE", "account_id": identity.account_id, "error": "already registered", "timestamp": ""})()
+        return type("Result", (), {"status": "SUCCESS", "account_id": identity.account_id, "error": "", "timestamp": ""})()
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", signup)
+    batch = queued_batch(1)
+    backend_main.process_batch(batch["id"])
+    result = backend_main.get_batch(batch["id"])
+    assert result["status"] == "COMPLETED"
+    assert result["successful"] == 1
+    assert result["skipped"] == 3
+    assert result["failed"] == 0
+
+
+def test_accounts_endpoint_works_without_jwt() -> None:
+    with TestClient(app) as client:
+        batch = client.post("/batches", json={"referral": "ACCOUNTS"}).json()
+        response = client.get(f"/batches/{batch['id']}/accounts")
+    assert response.status_code == 200
+    assert response.json() == {"accounts": []}
+    assert response.headers.get("x-content-type-options") == "nosniff"
+
+
+def test_write_retry_on_locked_database(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return 7
+
+    assert backend_main.with_write_retry(flaky) == 7
+    assert calls["n"] == 2

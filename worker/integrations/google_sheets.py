@@ -84,8 +84,6 @@ def append_result(result: dict) -> None:
 
 
 def _append_google_row(sheet_id: str, credentials_path: str, row: dict) -> None:
-    import gspread
-
     client = _get_gspread_client(credentials_path)
     worksheet_name = os.getenv("GOOGLE_SHEETS_WORKSHEET", "Results")
     sh = client.open_by_key(sheet_id)

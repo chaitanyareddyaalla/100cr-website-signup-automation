@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,7 +24,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from worker.automation.signup_flow import run_mock_signup
 from worker.generators.test_data import (
-    generate_identity,
     TestIdentity,
     DEFAULT_STATIC_NAME,
     DEFAULT_STATIC_PASSWORD,
@@ -67,7 +67,10 @@ class ErrorType(str, Enum):
 
 ALLOWED_STATE_TRANSITIONS: dict[str, set[str]] = {
     BatchStatus.CREATED.value: {BatchStatus.QUEUED.value},
-    BatchStatus.QUEUED.value: {BatchStatus.RUNNING.value},
+    BatchStatus.QUEUED.value: {
+        BatchStatus.RUNNING.value,
+        BatchStatus.STOPPING.value,
+    },
     BatchStatus.RUNNING.value: {
         BatchStatus.PAUSED.value,
         BatchStatus.STOPPING.value,
@@ -106,17 +109,29 @@ class BatchResponse(BaseModel):
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
 MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "2"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
+MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "2"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "30"))
+_live_adapter: AuthorizedPlaywrightAdapter | None = None
+_signup_slot_lock = threading.Lock()
+_signup_in_flight = 0
+_export_queue: Queue[dict | None] = Queue()
+_export_started = threading.Event()
+_export_init_lock = threading.Lock()
 
 
 def run_signup(identity):
     """Run the configured adapter, keeping live automation opt-in and bounded."""
+    global _live_adapter
     if automation_mode() == "mock":
         return run_mock_signup(identity)
-    return AuthorizedPlaywrightAdapter().signup(identity)
+    if _live_adapter is None:
+        _live_adapter = AuthorizedPlaywrightAdapter()
+    return _live_adapter.signup(identity)
+
+
 job_queue: Queue[str] = Queue()
 subscribers: dict[str, list[Queue[dict]]] = {}
 state_lock = threading.Lock()
@@ -133,10 +148,62 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def with_write_retry(fn):
+    """Retry a SQLite write once if another worker holds the lock."""
+    try:
+        return fn()
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
+        time.sleep(0.05)
+        return fn()
+
+
+def acquire_signup_slot() -> None:
+    global _signup_in_flight
+    while True:
+        cap = max(1, int(os.getenv("MAX_PARALLEL_SIGNUPS", "32")))
+        with _signup_slot_lock:
+            if _signup_in_flight < cap:
+                _signup_in_flight += 1
+                return
+        time.sleep(0.01)
+
+
+def release_signup_slot() -> None:
+    global _signup_in_flight
+    with _signup_slot_lock:
+        _signup_in_flight = max(0, _signup_in_flight - 1)
+
+
+def _export_loop() -> None:
+    while True:
+        item = _export_queue.get()
+        if item is None:
+            return
+        try:
+            append_result(item)
+        except Exception:
+            logger.warning("Result export failed; batch was not stalled")
+
+
+def schedule_export(row: dict) -> None:
+    if not _export_started.is_set():
+        with _export_init_lock:
+            if not _export_started.is_set():
+                threading.Thread(target=_export_loop, name="result-export", daemon=True).start()
+                _export_started.set()
+    _export_queue.put(row)
+
+
 def connect() -> sqlite3.Connection:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=60.0)
     connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout = 60000;")
+    except Exception:
+        pass
     return connection
 
 
@@ -174,7 +241,7 @@ def initialize_database() -> None:
             "name TEXT, place TEXT, referral TEXT, language TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL)"
         )
         # Backfill accounts from results_export.jsonl if present
-        export_file = RESULTS_PATH if 'RESULTS_PATH' in globals() else (DATABASE_PATH.parent / "results_export.jsonl")
+        export_file = globals().get('RESULTS_PATH', DATABASE_PATH.parent / "results_export.jsonl")
         if export_file.exists():
             try:
                 with export_file.open("r", encoding="utf-8") as f:
@@ -304,7 +371,8 @@ def publish_retry(batch_id: str, retry: int, error: str = "") -> None:
 def calculate_retry_delay(attempt: int) -> float:
     if attempt <= 0:
         return 0.0
-    return RETRY_DELAY_SECONDS * (RETRY_BACKOFF_MULTIPLIER ** (attempt - 1))
+    delay = RETRY_DELAY_SECONDS * (RETRY_BACKOFF_MULTIPLIER ** (attempt - 1))
+    return min(delay, MAX_RETRY_DELAY_SECONDS)
 
 
 def should_retry(status: str, batch_status: str | None, retry_count: int) -> bool:
@@ -312,7 +380,7 @@ def should_retry(status: str, batch_status: str | None, retry_count: int) -> boo
         return False
     if batch_status in {BatchStatus.CANCELLED.value, BatchStatus.COMPLETED.value, BatchStatus.FAILED.value}:
         return False
-    if status == "DUPLICATE":
+    if status in {"DUPLICATE", "LIMIT_REACHED"}:
         return False
     if retry_count >= MAX_SIGNUP_RETRIES:
         return False
@@ -326,6 +394,25 @@ def update_batch(batch_id: str, **changes: object) -> dict:
     with closing(connect()) as connection:
         connection.execute(f"UPDATE batches SET {assignments} WHERE id = ?", values)
         connection.commit()
+    batch = get_batch(batch_id)
+    publish(batch_id, batch)
+    return batch
+
+
+def increment_batch_counters(batch_id: str, **deltas: int) -> dict:
+    """Atomically add to batch counters so parallel workers cannot drop counts."""
+    assignments = ", ".join(f"{key} = {key} + ?" for key in deltas)
+    values = [*deltas.values(), now(), batch_id, BatchStatus.RUNNING.value]
+
+    def _do() -> None:
+        with closing(connect()) as connection:
+            connection.execute(
+                f"UPDATE batches SET {assignments}, updated_at = ? WHERE id = ? AND status = ?",
+                values,
+            )
+            connection.commit()
+
+    with_write_retry(_do)
     batch = get_batch(batch_id)
     publish(batch_id, batch)
     return batch
@@ -421,14 +508,17 @@ def recover_abandoned_jobs() -> int:
 
 
 def record_success(batch_id: str, account_id: str, test_id: str) -> dict | None:
-    with closing(connect()) as connection:
-        cursor = connection.execute(
-            "UPDATE batches SET successful = successful + 1, attempted = attempted + 1, updated_at = ? "
-            "WHERE id = ? AND status = ? AND successful < target",
-            (now(), batch_id, BatchStatus.RUNNING.value),
-        )
-        connection.commit()
-    if cursor.rowcount != 1:
+    def _do() -> int:
+        with closing(connect()) as connection:
+            cursor = connection.execute(
+                "UPDATE batches SET successful = successful + 1, attempted = attempted + 1, updated_at = ? "
+                "WHERE id = ? AND status = ? AND successful < target",
+                (now(), batch_id, BatchStatus.RUNNING.value),
+            )
+            connection.commit()
+            return cursor.rowcount
+
+    if with_write_retry(_do) != 1:
         return None
     known_account_ids.add(account_id)
     known_test_numbers.add(test_id)
@@ -666,6 +756,63 @@ def create_batch(referral: str) -> dict:
     return get_batch(batch_id)
 
 
+def _build_identity(batch_id: str, referral: str) -> TestIdentity:
+    available_ident = claim_next_available_identity(batch_id)
+    phone = available_ident or claim_unique_phone(batch_id)
+    return TestIdentity(
+        account_id=phone,
+        test_id=phone,
+        phone=phone,
+        name=DEFAULT_STATIC_NAME,
+        password=DEFAULT_STATIC_PASSWORD,
+        place=DEFAULT_STATIC_PLACE,
+        language=DEFAULT_STATIC_LANGUAGE,
+        referral=referral,
+    )
+
+
+def _record_account(identity: TestIdentity, result, batch_id: str, referral: str) -> None:
+    def _do() -> None:
+        with closing(connect()) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO accounts (id, batch_id, phone, password, name, place, referral, language, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result.account_id,
+                    batch_id,
+                    identity.phone,
+                    getattr(identity, "password", ""),
+                    identity.name,
+                    getattr(identity, "place", ""),
+                    referral,
+                    getattr(identity, "language", ""),
+                    result.status,
+                    getattr(result, "timestamp", now()),
+                ),
+            )
+            connection.commit()
+
+    try:
+        with_write_retry(_do)
+    except Exception:
+        logger.warning("Could not record account into accounts table")
+
+
+def _insert_attempt(job_id: str, status: str, error: str, attempt_number: int) -> None:
+    def _do() -> None:
+        with closing(connect()) as connection:
+            connection.execute(
+                "INSERT INTO attempts (id, job_id, status, error, attempt_number, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid4()), job_id, status, error, attempt_number, now()),
+            )
+            connection.commit()
+
+    try:
+        with_write_retry(_do)
+    except Exception:
+        logger.warning("Could not record signup attempt")
+
+
 def process_batch(batch_id: str) -> None:
     logger.info(f"Starting to process batch {batch_id}")
     pause_event = pause_events.setdefault(batch_id, threading.Event())
@@ -682,103 +829,76 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id, "SKIPPED")
             return
 
-        attempt = 0
-        while True:
-            batch = get_batch(batch_id)
-            if batch["successful"] >= batch["target"]:
-                logger.info(f"Batch {batch_id} completed with {batch['successful']} successful signups")
-                update_batch(batch_id, completed_at=now(), status=BatchStatus.COMPLETED.value)
-                acknowledge_job(job_id)
-                return
-            if stop_event.is_set() or batch["status"] == BatchStatus.STOPPING.value:
-                logger.info(f"Batch {batch_id} is being stopped")
-                if batch["status"] == BatchStatus.PAUSED.value:
-                    transition_batch(batch_id, BatchStatus.STOPPING.value, "Only paused batches can stop")
-                transition_batch(batch_id, BatchStatus.CANCELLED.value, "Only stopping batches can cancel")
-                acknowledge_job(job_id, "CANCELLED")
-                return
-            if batch["status"] == BatchStatus.PAUSED.value:
-                pause_event.wait(0.05)
-                continue
-            if batch["status"] != BatchStatus.RUNNING.value:
-                acknowledge_job(job_id, "STOPPED")
-                return
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "20"))
+        concurrency = max(
+            1,
+            min(
+                int(os.getenv("SIGNUP_CONCURRENCY", "16")),
+                int(os.getenv("MAX_PARALLEL_SIGNUPS", "32")),
+            ),
+        )
+        limit_reached_event = threading.Event()
+        circuit_event = threading.Event()
+        fail_lock = threading.Lock()
+        consecutive_failures = 0
+        fatal: list[BaseException] = []
 
-            available_ident = claim_next_available_identity(batch_id)
-            if available_ident:
-                identity = TestIdentity(
-                    account_id=available_ident,
-                    test_id=available_ident,
-                    phone=available_ident,
-                    name=DEFAULT_STATIC_NAME,
-                    password=DEFAULT_STATIC_PASSWORD,
-                    place=DEFAULT_STATIC_PLACE,
-                    language=DEFAULT_STATIC_LANGUAGE,
-                    referral=batch.get("referral", ""),
-                )
-            else:
-                unique_phone = claim_unique_phone(batch_id)
-                identity = TestIdentity(
-                    account_id=unique_phone,
-                    test_id=unique_phone,
-                    phone=unique_phone,
-                    name=DEFAULT_STATIC_NAME,
-                    password=DEFAULT_STATIC_PASSWORD,
-                    place=DEFAULT_STATIC_PLACE,
-                    language=DEFAULT_STATIC_LANGUAGE,
-                    referral=batch.get("referral", ""),
-                )
-                attempt += 1
-
-            current = get_batch(batch_id)
-            if current["status"] != BatchStatus.RUNNING.value or stop_event.is_set():
-                continue
-
-            mark_identity_processing(identity.test_id, batch_id)
-
-            for retry in range(MAX_SIGNUP_RETRIES + 1):
-                heartbeat_job(job_id)
-                current = get_batch(batch_id)
-                if stop_event.is_set() or current["status"] == BatchStatus.STOPPING.value:
-                    transition_batch(batch_id, BatchStatus.CANCELLED.value, "Only stopping batches can cancel")
-                    acknowledge_job(job_id, "CANCELLED")
+        def run_one(identity: TestIdentity) -> None:
+            nonlocal consecutive_failures
+            acquire_signup_slot()
+            try:
+                if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set():
                     return
+                current = get_batch(batch_id)
                 if current["status"] != BatchStatus.RUNNING.value:
                     return
-                result = run_signup(identity)
-                with closing(connect()) as connection:
-                    connection.execute(
-                        "INSERT INTO attempts (id, job_id, status, error, attempt_number, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (str(uuid4()), job_id, result.status, getattr(result, "error", ""), retry + 1, now()),
-                    )
-                    connection.commit()
-                if result.status == "SUCCESS":
-                    logger.info(f"Batch {batch_id}: Signup successful for {identity.account_id}")
-                    mark_phone_status(identity.phone, "SUCCESS")
-                    recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
-                    if recorded_batch is not None:
-                        try:
-                            with closing(connect()) as conn_acc:
-                                conn_acc.execute(
-                                    "INSERT OR REPLACE INTO accounts (id, batch_id, phone, password, name, place, referral, language, status, created_at) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (
-                                        result.account_id,
-                                        batch_id,
-                                        identity.phone,
-                                        getattr(identity, "password", ""),
-                                        identity.name,
-                                        getattr(identity, "place", ""),
-                                        recorded_batch["referral"],
-                                        getattr(identity, "language", ""),
-                                        result.status,
-                                        getattr(result, "timestamp", now()),
-                                    ),
-                                )
-                                conn_acc.commit()
-                        except Exception as err:
-                            logger.warning(f"Could not record account into accounts table: {err}")
-                        append_result({
+                mark_identity_processing(identity.test_id, batch_id)
+                for retry in range(MAX_SIGNUP_RETRIES + 1):
+                    if stop_event.is_set() or limit_reached_event.is_set() or circuit_event.is_set():
+                        return
+                    current = get_batch(batch_id)
+                    if current["status"] != BatchStatus.RUNNING.value:
+                        return
+                    try:
+                        result = run_signup(identity)
+                    except Exception as exc:
+                        fatal.append(exc)
+                        return
+                    _insert_attempt(job_id, result.status, getattr(result, "error", "") or "", retry + 1)
+                    if result.status == "SUCCESS":
+                        with fail_lock:
+                            consecutive_failures = 0
+                        logger.info("Batch %s: signup succeeded", batch_id)
+                        mark_phone_status(identity.phone, "SUCCESS")
+                        recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
+                        if recorded_batch is not None:
+                            _record_account(identity, result, batch_id, recorded_batch["referral"])
+                            schedule_export({
+                                "id": result.account_id,
+                                "name": identity.name,
+                                "test_id": identity.test_id,
+                                "phone": identity.phone,
+                                "password": getattr(identity, "password", ""),
+                                "place": getattr(identity, "place", ""),
+                                "language": getattr(identity, "language", ""),
+                                "referral": recorded_batch["referral"],
+                                "batch_id": batch_id,
+                                "status": result.status,
+                                "error": getattr(result, "error", ""),
+                                "created_at": getattr(result, "timestamp", now()),
+                            })
+                        return
+                    if result.status == "LIMIT_REACHED":
+                        logger.warning("Batch %s: referral reached maximum limit; stopping new signups", batch_id)
+                        mark_phone_status(identity.phone, "FAILED")
+                        limit_reached_event.set()
+                        return
+                    if result.status == "DUPLICATE":
+                        logger.info("Batch %s: phone already registered; skipping and trying another", batch_id)
+                        mark_phone_status(identity.phone, "DUPLICATE")
+                        increment_batch_counters(batch_id, skipped=1, attempted=1)
+                        finalize_identity(identity.test_id, "SKIPPED", batch_id)
+                        schedule_export({
                             "id": result.account_id,
                             "name": identity.name,
                             "test_id": identity.test_id,
@@ -786,51 +906,116 @@ def process_batch(batch_id: str) -> None:
                             "password": getattr(identity, "password", ""),
                             "place": getattr(identity, "place", ""),
                             "language": getattr(identity, "language", ""),
-                            "referral": recorded_batch["referral"],
+                            "referral": current.get("referral", ""),
                             "batch_id": batch_id,
-                            "status": result.status,
-                            "error": getattr(result, "error", ""),
+                            "status": "SKIPPED",
+                            "error": getattr(result, "error", "") or "Duplicate account skipped",
                             "created_at": getattr(result, "timestamp", now()),
                         })
-                    break
-                if result.status == "DUPLICATE":
-                    logger.info(f"Batch {batch_id}: Duplicate identity {identity.account_id} - skipped")
-                    mark_phone_status(identity.phone, "DUPLICATE")
-                    current = get_batch(batch_id)
-                    recorded_batch = update_batch(batch_id, skipped=current["skipped"] + 1, attempted=current["attempted"] + 1)
-                    finalize_identity(identity.test_id, "SKIPPED", batch_id)
-                    append_result({
-                        "id": result.account_id,
-                        "name": identity.name,
-                        "test_id": identity.test_id,
-                        "phone": identity.phone,
-                        "password": getattr(identity, "password", ""),
-                        "place": getattr(identity, "place", ""),
-                        "language": getattr(identity, "language", ""),
-                        "referral": recorded_batch["referral"],
-                        "batch_id": batch_id,
-                        "status": "SKIPPED",
-                        "error": getattr(result, "error", "Duplicate account skipped"),
-                        "created_at": getattr(result, "timestamp", now()),
-                    })
-                    break
-                if should_retry(result.status, current["status"], retry):
-                    next_retry = retry + 1
-                    logger.warning(f"Batch {batch_id}: Retry {next_retry} for {identity.account_id} (status: {result.status})")
-                    current = get_batch(batch_id)
-                    update_batch(batch_id, retries=current["retries"] + 1, attempted=current["attempted"] + 1)
-                    publish_retry(batch_id, next_retry, getattr(result, "error", ""))
-                    delay = calculate_retry_delay(next_retry)
-                    if delay > 0:
-                        time.sleep(delay)
-                    continue
-                current = get_batch(batch_id)
-                logger.warning(f"Batch {batch_id}: Signup failed for {identity.account_id}")
-                mark_phone_status(identity.phone, "FAILED")
-                update_batch(batch_id, failed=current["failed"] + 1, attempted=current["attempted"] + 1)
-                finalize_identity(identity.test_id, "FAILED", batch_id)
-                break
-            time.sleep(0.01)
+                        return
+                    if should_retry(result.status, current["status"], retry):
+                        next_retry = retry + 1
+                        logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
+                        increment_batch_counters(batch_id, retries=1, attempted=1)
+                        publish_retry(batch_id, next_retry, getattr(result, "error", ""))
+                        delay = calculate_retry_delay(next_retry)
+                        if delay > 0 and stop_event.wait(delay):
+                            return
+                        continue
+                    logger.warning("Batch %s: signup failed after retries", batch_id)
+                    mark_phone_status(identity.phone, "FAILED")
+                    increment_batch_counters(batch_id, failed=1, attempted=1)
+                    finalize_identity(identity.test_id, "FAILED", batch_id)
+                    with fail_lock:
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            logger.error(
+                                "Batch %s: circuit breaker after %s consecutive failures",
+                                batch_id,
+                                consecutive_failures,
+                            )
+                            circuit_event.set()
+                    return
+            finally:
+                release_signup_slot()
+
+        def drain(pending: set, timeout: float | None = 0.2) -> set:
+            if not pending:
+                return pending
+            done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            for finished in done:
+                exc = finished.exception()
+                if exc is not None:
+                    fatal.append(exc)
+            heartbeat_job(job_id)
+            return pending
+
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"signup-{batch_id[:8]}") as pool:
+            pending: set = set()
+            try:
+                while True:
+                    pending = drain(pending)
+                    if fatal:
+                        break
+                    batch = get_batch(batch_id)
+                    if batch["successful"] >= batch["target"]:
+                        break
+                    if limit_reached_event.is_set() or circuit_event.is_set():
+                        break
+                    if stop_event.is_set() or batch["status"] == BatchStatus.STOPPING.value:
+                        break
+                    if batch["status"] == BatchStatus.PAUSED.value:
+                        pause_event.wait(0.05)
+                        heartbeat_job(job_id)
+                        continue
+                    if batch["status"] != BatchStatus.RUNNING.value:
+                        break
+                    while (
+                        len(pending) < concurrency
+                        and (batch["successful"] + len(pending)) < batch["target"]
+                        and not stop_event.is_set()
+                        and not limit_reached_event.is_set()
+                        and not circuit_event.is_set()
+                    ):
+                        identity = _build_identity(batch_id, batch.get("referral", ""))
+                        pending.add(pool.submit(run_one, identity))
+                        batch = get_batch(batch_id)
+            finally:
+                if pending:
+                    done, still = wait(pending, timeout=120)
+                    for finished in done:
+                        exc = finished.exception()
+                        if exc is not None:
+                            fatal.append(exc)
+                    pending = still
+                    heartbeat_job(job_id)
+
+        if fatal:
+            raise fatal[0]
+
+        batch = get_batch(batch_id)
+        if stop_event.is_set() or batch["status"] == BatchStatus.STOPPING.value:
+            logger.info(f"Batch {batch_id} is being stopped")
+            if batch["status"] == BatchStatus.PAUSED.value:
+                transition_batch(batch_id, BatchStatus.STOPPING.value, "Only paused batches can stop")
+            if get_batch(batch_id)["status"] == BatchStatus.STOPPING.value:
+                transition_batch(batch_id, BatchStatus.CANCELLED.value, "Only stopping batches can cancel")
+            acknowledge_job(job_id, "CANCELLED")
+            return
+        if batch["successful"] >= batch["target"]:
+            logger.info(f"Batch {batch_id} completed with {batch['successful']} successful signups")
+            update_batch(batch_id, completed_at=now(), status=BatchStatus.COMPLETED.value)
+            acknowledge_job(job_id)
+            return
+        if limit_reached_event.is_set() or circuit_event.is_set():
+            final_status = BatchStatus.COMPLETED.value if batch["successful"] > 0 else BatchStatus.FAILED.value
+            update_batch(batch_id, status=final_status, completed_at=now())
+            acknowledge_job(job_id, final_status)
+            return
+        if batch["status"] != BatchStatus.RUNNING.value:
+            acknowledge_job(job_id, "STOPPED")
+            return
+        acknowledge_job(job_id)
     except Exception as e:
         logger.error(f"Error processing batch {batch_id}: {e}", exc_info=True)
         try:
@@ -896,6 +1081,15 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+@app.middleware("http")
 async def rate_limit(request: Request, call_next):
     """Bound local rate limiting; Redis should replace this for multi-instance use."""
     if request.url.path in {"/health", "/healthz", "/ready"}:
@@ -920,6 +1114,15 @@ def startup() -> None:
     logger.info(f"Database path: {DATABASE_PATH}")
     initialize_database()
     load_used_phones()
+    # Re-enqueue any jobs that were left in QUEUED state in the database
+    with closing(connect()) as connection:
+        queued_rows = connection.execute(
+            "SELECT batch_id FROM jobs WHERE status = 'QUEUED' ORDER BY rowid ASC"
+        ).fetchall()
+        for row in queued_rows:
+            job_queue.put(row["batch_id"])
+        if queued_rows:
+            logger.info(f"Re-enqueued {len(queued_rows)} pending queued jobs on startup")
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
@@ -1040,34 +1243,13 @@ def stop_batch(batch_id: str) -> dict:
     batch = transition_batch(
         batch_id,
         BatchStatus.STOPPING.value,
-        "Only running or paused batches can be stopped",
+        "Only running, paused, or queued batches can be stopped",
     )
     stop_events.setdefault(batch_id, threading.Event()).set()
     return batch
 
 
 @app.get("/batches/{batch_id}/events", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
-async def batch_events(batch_id: str) -> StreamingResponse:
-    get_batch(batch_id)
-    updates: Queue[dict] = Queue()
-    with state_lock:
-        subscribers.setdefault(batch_id, []).append(updates)
-
-    async def stream() -> AsyncGenerator[str, None]:
-        try:
-            updates.put(get_batch(batch_id))
-            while True:
-                try:
-                    batch = await asyncio.to_thread(updates.get, True, 0.5)
-                    yield f"data: {json.dumps(batch)}\n\n"
-                    if batch["status"] in (BatchStatus.COMPLETED.value, BatchStatus.CANCELLED.value, BatchStatus.FAILED.value):
-                        return
-                except Empty:
-                    yield ": keep-alive\n\n"
-                await asyncio.sleep(0)
-        finally:
-            with state_lock:
-                queue_list = subscribers.get(batch_id)
 async def batch_events(batch_id: str) -> StreamingResponse:
     get_batch(batch_id)
     updates: Queue[dict] = Queue()
@@ -1097,8 +1279,10 @@ async def batch_events(batch_id: str) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-@app.get("/batches/{batch_id}/accounts")
+@app.get("/batches/{batch_id}/accounts", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
 def get_batch_accounts(batch_id: str, limit: int = 200):
+    get_batch(batch_id)
+    limit = max(1, min(int(limit), 500))
     with closing(connect()) as connection:
         rows = connection.execute(
             "SELECT id, batch_id, phone, password, name, place, referral, language, status, created_at "

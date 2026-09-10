@@ -1,10 +1,8 @@
 """Dedicated production/development worker process."""
 
 import logging
-import os
 import signal
 import sys
-import time
 
 from backend.app.main import initialize_database, worker_loop, WORKER_ID
 

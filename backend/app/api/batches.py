@@ -1,11 +1,11 @@
 """Batch management API endpoints."""
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from backend.app.models.models import BatchResponse, ReferralRequest, BatchStatus
 from backend.app.main import (
     get_batch, create_batch, update_batch, transition_batch,
-    claim_job, create_job, acknowledge_job, job_queue,
+    create_job, job_queue,
     pause_events, stop_events
 )
 

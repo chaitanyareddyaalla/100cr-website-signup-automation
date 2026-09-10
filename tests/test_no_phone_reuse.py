@@ -1,4 +1,3 @@
-import pytest
 from backend.app import main as backend_main
 
 

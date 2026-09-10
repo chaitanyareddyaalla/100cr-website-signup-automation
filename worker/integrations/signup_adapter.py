@@ -1,6 +1,8 @@
+import json
+import logging
 import os
+import threading
 from typing import Protocol
-from urllib.parse import urlparse
 
 try:
     from ..automation.browser_manager import BrowserManager
@@ -10,6 +12,42 @@ except ImportError:
     from automation.browser_manager import BrowserManager
     from generators.test_data import TestIdentity
     from automation.signup_flow import SignupResult
+
+logger = logging.getLogger(__name__)
+
+_HTTP_POOL = None
+_HTTP_POOL_LOCK = threading.Lock()
+
+_DUPLICATE_MARKERS = (
+    "already registered",
+    "already exist",
+    "already used",
+    "phone already",
+    "number already",
+    "duplicate",
+)
+_LIMIT_MARKERS = (
+    "maximum limit",
+    "reached its maximum",
+    "referral code has reached",
+    "limit reached",
+)
+
+
+def _http_pool():
+    global _HTTP_POOL
+    with _HTTP_POOL_LOCK:
+        if _HTTP_POOL is None:
+            import urllib3
+
+            maxsize = max(1, int(os.getenv("MAX_PARALLEL_SIGNUPS", "32")))
+            _HTTP_POOL = urllib3.PoolManager(
+                num_pools=4,
+                maxsize=maxsize,
+                timeout=urllib3.Timeout(connect=5.0, read=10.0),
+                retries=False,
+            )
+        return _HTTP_POOL
 
 
 class SignupAdapter(Protocol):
@@ -27,7 +65,9 @@ class AuthorizedPlaywrightAdapter:
     """Live automation adapter supporting direct API registration and Playwright browser signup."""
 
     def __init__(self, base_url: str | None = None, timeout_ms: int = 15_000) -> None:
-        self.base_url = (base_url or os.getenv("AUTHORIZED_TEST_BASE_URL", "https://api.universalcompanys.com/api/auth/signup")).rstrip("/")
+        self.base_url = (
+            base_url or os.getenv("AUTHORIZED_TEST_BASE_URL", "https://api.universalcompanys.com/api/auth/signup")
+        ).rstrip("/")
         self.timeout_ms = timeout_ms
 
     def signup(self, identity: TestIdentity) -> SignupResult:
@@ -37,39 +77,49 @@ class AuthorizedPlaywrightAdapter:
         return self._api_signup(identity)
 
     def _api_signup(self, identity: TestIdentity) -> SignupResult:
-        import json
-        import urllib.error
-        import urllib.request
+        import urllib3
 
-        payload = {
-            "name": identity.name or "Chaitanya Reddy",
-            "phone": identity.phone,
-            "place": identity.place or "Hyderabad",
-            "password": identity.password or "SecurePass@123",
-            "referral_code": identity.referral,
-        }
+        payload = json.dumps(
+            {
+                "name": identity.name or "Chaitanya Reddy",
+                "phone": identity.phone,
+                "place": identity.place or "Hyderabad",
+                "password": identity.password or "SecurePass@123",
+                "referral_code": identity.referral,
+            }
+        ).encode("utf-8")
 
         endpoint = self.base_url if "api" in self.base_url else f"{self.base_url}/api/auth/signup"
         try:
-            req = urllib.request.Request(
+            resp = _http_pool().request(
+                "POST",
                 endpoint,
-                data=json.dumps(payload).encode("utf-8"),
+                body=payload,
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 },
-                method="POST",
             )
-            with urllib.request.urlopen(req, timeout=self.timeout_ms / 1000.0) as resp:
-                resp.read().decode("utf-8", errors="replace")
+            if 200 <= resp.status < 300:
                 return SignupResult.success(identity.account_id, phone=identity.phone)
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            if "already registered" in body.lower():
-                return SignupResult.duplicate(identity.account_id, phone=identity.phone)
-            return SignupResult.failure(identity.account_id, error=body or str(exc), phone=identity.phone)
+            body = (resp.data or b"").decode("utf-8", errors="replace")
+            return self._classify_error_body(identity, body, http_status=resp.status)
+        except (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.TimeoutError):
+            return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
         except Exception as exc:
             return SignupResult.failure(identity.account_id, error=str(exc), phone=identity.phone)
+
+    def _classify_error_body(self, identity: TestIdentity, body: str, http_status: int = 0) -> SignupResult:
+        body_lower = (body or "").lower()
+        if http_status == 409 or any(marker in body_lower for marker in _DUPLICATE_MARKERS):
+            return SignupResult.duplicate(identity.account_id, phone=identity.phone)
+        if any(marker in body_lower for marker in _LIMIT_MARKERS):
+            return SignupResult.limit_reached(
+                identity.account_id,
+                error=body or "Referral code maximum limit reached",
+                phone=identity.phone,
+            )
+        return SignupResult.failure(identity.account_id, error=body or f"HTTP {http_status}", phone=identity.phone)
 
     def _browser_signup(self, identity: TestIdentity) -> SignupResult:
         try:
@@ -98,6 +148,6 @@ class AuthorizedPlaywrightAdapter:
                     context.close()
                     browser.close()
         except PlaywrightTimeoutError:
-            return SignupResult.failure(identity.account_id, "TIMEOUT", phone=identity.phone)
+            return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
         except Exception as exc:
-            return SignupResult.failure(identity.account_id, f"SITE_ERROR: {exc}", phone=identity.phone)
+            return SignupResult.failure(identity.account_id, error=f"SITE_ERROR: {exc}", phone=identity.phone)
