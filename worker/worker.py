@@ -26,7 +26,7 @@ def main() -> None:
         signal.signal(signal.SIGTERM, handle_shutdown)
 
     try:
-        worker_loop()
+        worker_loop(worker_name=WORKER_ID)
     except KeyboardInterrupt:
         logger.info("Worker interrupted. Exiting.")
 

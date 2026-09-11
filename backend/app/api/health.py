@@ -26,26 +26,32 @@ def health() -> dict[str, str]:
 
 
 @router.get("/ready", response_model=ReadinessResponse)
-def readiness() -> dict[str, str]:
+def readiness() -> dict[str, object]:
     """Readiness check - verifies system is ready to receive traffic."""
     try:
-        # Check database connection
+        from backend.app.main import job_queue
         with closing(connect()) as connection:
             connection.execute("SELECT 1").fetchone()
         
-        # Check worker thread is running (would need to add a flag for this)
-        worker_status = "running" if threading.active_count() > 1 else "starting"
+        active_workers = job_queue.get_active_workers(max_age_seconds=45.0)
+        worker_status = "running" if (len(active_workers) > 0 or threading.active_count() > 1) else "starting"
+        redis_status = "connected" if job_queue._redis is not None else "offline_or_local_fallback"
         
         logger.info("Readiness check: ready")
         return {
             "status": "ready",
             "database": "ok",
-            "worker": worker_status
+            "worker": worker_status,
+            "redis": redis_status,
+            "active_workers": len(active_workers),
         }
     except Exception as e:
         logger.error(f"Readiness check failed: {e}")
         return {
             "status": "not_ready",
             "database": "error",
-            "worker": "error"
+            "worker": "error",
+            "redis": "error",
+            "active_workers": 0,
         }
+

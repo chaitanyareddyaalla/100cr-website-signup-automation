@@ -80,6 +80,8 @@ class ReadinessResponse(BaseModel):
     status: str
     database: str
     worker: str
+    redis: Optional[str] = None
+    active_workers: Optional[int] = None
 
 
 # ============================================================

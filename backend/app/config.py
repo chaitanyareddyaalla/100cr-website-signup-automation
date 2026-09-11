@@ -16,8 +16,8 @@ def app_environment() -> str:
 
 
 def automation_mode() -> str:
-    """Return the selected automation mode, defaulting safely to mock."""
-    return os.getenv("AUTOMATION_MODE", "mock").lower()
+    """Return the selected automation mode, defaulting to live."""
+    return os.getenv("AUTOMATION_MODE", "live").lower()
 
 
 def validate_automation_configuration() -> None:
@@ -67,10 +67,6 @@ class Settings(BaseSettings):
     retry_delay_seconds: float = float(os.getenv("RETRY_DELAY_SECONDS", "2"))
     retry_backoff_multiplier: float = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
     
-    # Google Sheets
-    google_sheets_id: str = os.getenv("GOOGLE_SHEETS_ID", "")
-    google_sheets_worksheet: str = os.getenv("GOOGLE_SHEETS_WORKSHEET", "Results")
-    google_service_account_json: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

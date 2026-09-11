@@ -25,6 +25,11 @@ _DUPLICATE_MARKERS = (
     "phone already",
     "number already",
     "duplicate",
+    "exists",
+    "registered",
+    "taken",
+    "user already",
+    "account already",
 )
 _LIMIT_MARKERS = (
     "maximum limit",
@@ -60,11 +65,6 @@ class SignupAdapter(Protocol):
     def signup(self, identity: TestIdentity) -> SignupResult:
         ...
 
-
-class MockSignupAdapter:
-    def signup(self, identity: TestIdentity) -> SignupResult:
-        with BrowserManager():
-            return SignupResult.success(identity.account_id)
 
 
 class AuthorizedPlaywrightAdapter:

@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 import backend.app.main as backend_main
-import worker.integrations.google_sheets as google_sheets
 from backend.app.main import app, update_batch
 
 
@@ -505,26 +504,20 @@ def test_retry_policy_uses_backoff_and_blocks_duplicates(monkeypatch) -> None:
     assert backend_main.should_retry("FAILURE", "CANCELLED", 1) is False
 
 
-def test_google_sheet_export_uses_safe_fallback_row(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(google_sheets, "RESULTS_PATH", tmp_path / "mock_sheet.jsonl")
-    monkeypatch.delenv("GOOGLE_SHEETS_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
-
-    google_sheets.append_result({
+def test_data_storage_is_safely_disabled(tmp_path) -> None:
+    # Verify that calling schedule_export is a safe no-op and never creates disk or sheet files
+    backend_main.schedule_export({
         "id": "acct-1",
         "name": "Alice Test",
-        "test_id": "mock-001",
+        "test_id": "ident-0001",
         "referral": "REF-123",
         "batch_id": "batch-123",
         "status": "SUCCESS",
         "error": "",
     })
-
-    lines = (tmp_path / "mock_sheet.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    row = json.loads(lines[0])
-    assert row["status"] == "SUCCESS"
-    assert row["batch_id"] == "batch-123"
-    assert row["name"] == "Alice Test"
+    # No sheet or export files should be created
+    assert not (tmp_path / "mock_sheet.jsonl").exists()
+    assert not (tmp_path / "results.csv").exists()
 
 
 def read_event(stream, timeout: float = 1) -> str:

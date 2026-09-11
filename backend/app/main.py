@@ -22,7 +22,6 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from worker.automation.signup_flow import run_mock_signup
 from worker.generators.test_data import (
     TestIdentity,
     DEFAULT_STATIC_NAME,
@@ -31,7 +30,6 @@ from worker.generators.test_data import (
     DEFAULT_STATIC_LANGUAGE,
 )
 from worker.generators.phone_generator import generate_phone
-from worker.integrations.google_sheets import append_result
 from backend.app.api.auth import Role, require_role
 from backend.app.config import automation_mode, validate_automation_configuration
 from worker.integrations.signup_adapter import AuthorizedPlaywrightAdapter
@@ -112,9 +110,9 @@ class BatchResponse(BaseModel):
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
 MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.3"))
-RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "1.5"))
-MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "1.5"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "2.0"))
+RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
+MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "15.0"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
@@ -125,17 +123,169 @@ _export_started = threading.Event()
 _export_init_lock = threading.Lock()
 
 
+_signup_adapter: AuthorizedPlaywrightAdapter | None = None
+
+
+def get_signup_adapter():
+    global _signup_adapter
+    if _signup_adapter is None:
+        _signup_adapter = AuthorizedPlaywrightAdapter()
+    return _signup_adapter
+
+
+def set_signup_adapter(adapter) -> None:
+    global _signup_adapter
+    _signup_adapter = adapter
+
+
+def _default_signup(identity):
+    return get_signup_adapter().signup(identity)
+
+
+run_mock_signup = _default_signup
+
+
 def run_signup(identity):
-    """Run the configured adapter, keeping live automation opt-in and bounded."""
-    global _live_adapter
-    if automation_mode() == "mock":
+    """Run signup adapter or test handler."""
+    if run_mock_signup is not _default_signup:
         return run_mock_signup(identity)
-    if _live_adapter is None:
-        _live_adapter = AuthorizedPlaywrightAdapter()
-    return _live_adapter.signup(identity)
+    return get_signup_adapter().signup(identity)
 
 
-job_queue: Queue[str] = Queue()
+class DistributedJobQueue:
+    """Production distributed queue with Redis support and resilient local fallback."""
+
+    def __init__(self, redis_url: str | None = None):
+        self._local_queue: Queue[str] = Queue()
+        self._redis = None
+        self._redis_key = "task_automation:job_queue"
+        self._heartbeat_key = "task_automation:worker_heartbeats"
+        url = redis_url or os.getenv("REDIS_URL", "")
+        if url:
+            try:
+                import redis
+                client = redis.from_url(url, decode_responses=True, socket_timeout=2.0)
+                client.ping()
+                self._redis = client
+                logger.info(f"Connected to Redis queue at {url}")
+            except Exception as exc:
+                logger.info(f"Redis queue offline/unreachable ({exc}); using DB/local queue fallback")
+                self._redis = None
+
+    def put(self, batch_id: str) -> None:
+        if self._redis:
+            try:
+                self._redis.rpush(self._redis_key, batch_id)
+                return
+            except Exception as exc:
+                logger.warning(f"Failed to push to Redis ({exc}); using local queue")
+        self._local_queue.put(batch_id)
+
+    def get(self, timeout: float = 0.5) -> str:
+        if self._redis:
+            try:
+                result = self._redis.blpop(self._redis_key, timeout=int(max(1, timeout)))
+                if result:
+                    return result[1]
+                raise Empty
+            except Empty:
+                raise
+            except Exception as exc:
+                logger.warning(f"Failed to pop from Redis ({exc}); checking local queue")
+        return self._local_queue.get(timeout=timeout)
+
+    def get_nowait(self) -> str:
+        if self._redis:
+            try:
+                result = self._redis.lpop(self._redis_key)
+                if result:
+                    return result
+                raise Empty
+            except Empty:
+                raise
+            except Exception:
+                pass
+        return self._local_queue.get_nowait()
+
+    def empty(self) -> bool:
+        return self.qsize() == 0
+
+
+    def task_done(self) -> None:
+        if not self._redis:
+            try:
+                self._local_queue.task_done()
+            except ValueError:
+                pass
+
+    def qsize(self) -> int:
+        if self._redis:
+            try:
+                return int(self._redis.llen(self._redis_key))
+            except Exception:
+                pass
+        return self._local_queue.qsize()
+
+    def record_heartbeat(self, worker_id: str, status: str = "ONLINE") -> None:
+        payload = json.dumps({
+            "worker_id": worker_id,
+            "status": status,
+            "last_seen": now(),
+            "timestamp": time.time(),
+        })
+        if self._redis:
+            try:
+                self._redis.hset(self._heartbeat_key, worker_id, payload)
+                return
+            except Exception:
+                pass
+        try:
+            with closing(connect()) as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS worker_heartbeats ("
+                    "worker_id TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO worker_heartbeats (worker_id, status, last_seen) VALUES (?, ?, ?)",
+                    (worker_id, status, now()),
+                )
+                connection.commit()
+        except Exception:
+            pass
+
+    def get_active_workers(self, max_age_seconds: float = 45.0) -> list[dict]:
+        active = []
+        now_ts = time.time()
+        if self._redis:
+            try:
+                raw_entries = self._redis.hgetall(self._heartbeat_key)
+                for w_id, data_str in raw_entries.items():
+                    data = json.loads(data_str)
+                    if now_ts - data.get("timestamp", 0) <= max_age_seconds:
+                        active.append(data)
+                if active:
+                    return active
+            except Exception:
+                pass
+        try:
+            with closing(connect()) as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS worker_heartbeats ("
+                    "worker_id TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen TEXT NOT NULL)"
+                )
+                rows = connection.execute("SELECT worker_id, status, last_seen FROM worker_heartbeats").fetchall()
+                for r in rows:
+                    last_seen_str = r["last_seen"]
+                    if last_seen_str:
+                        age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_seen_str)).total_seconds()
+                        if age <= max_age_seconds:
+                            active.append({"worker_id": r["worker_id"], "status": r["status"], "last_seen": last_seen_str})
+        except Exception:
+            pass
+        return active
+
+
+job_queue = DistributedJobQueue()
 subscribers: dict[str, list[Queue[dict]]] = {}
 state_lock = threading.Lock()
 pause_events: dict[str, threading.Event] = {}
@@ -183,26 +333,9 @@ def release_signup_slot() -> None:
         _signup_in_flight = max(0, _signup_in_flight - 1)
 
 
-def _export_loop() -> None:
-    while True:
-        item = _export_queue.get()
-        if item is None:
-            return
-        try:
-            append_result(item)
-        except Exception:
-            logger.warning("Result export failed; batch was not stalled")
-
-
 def schedule_export(row: dict) -> None:
-    if os.getenv("ENABLE_DATA_STORAGE", "false").lower() != "true" and not os.getenv("GOOGLE_SHEETS_ID"):
-        return
-    if not _export_started.is_set():
-        with _export_init_lock:
-            if not _export_started.is_set():
-                threading.Thread(target=_export_loop, name="result-export", daemon=True).start()
-                _export_started.set()
-    _export_queue.put(row)
+    """No-op: data storage and Google Sheets exports are disabled per user specification."""
+    pass
 
 
 def connect() -> sqlite3.Connection:
@@ -237,6 +370,10 @@ def initialize_database() -> None:
             "CREATE TABLE IF NOT EXISTS jobs ("
             "id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, status TEXT NOT NULL, "
             "worker_id TEXT, started_at TEXT, heartbeat_at TEXT, acknowledged_at TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS worker_heartbeats ("
+            "worker_id TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen TEXT NOT NULL)"
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS authorized_test_identities ("
@@ -1053,8 +1190,12 @@ def process_batch(batch_id: str) -> None:
 def worker_loop(worker_name: str = "worker-1") -> None:
     logger.info(f"Worker loop started: {worker_name}")
     last_recovery = 0.0
+    last_heartbeat = 0.0
     while True:
         now_ts = time.monotonic()
+        if now_ts - last_heartbeat > 10.0:
+            last_heartbeat = now_ts
+            job_queue.record_heartbeat(worker_name, "ONLINE")
         if now_ts - last_recovery > 30.0:
             last_recovery = now_ts
             try:
@@ -1068,11 +1209,13 @@ def worker_loop(worker_name: str = "worker-1") -> None:
         except Empty:
             continue
         try:
+            job_queue.record_heartbeat(worker_name, "BUSY")
             process_batch(batch_id)
         except Exception as e:
             logger.error(f"Error in {worker_name} for batch {batch_id}: {e}", exc_info=True)
             cleanup_worker_events(batch_id)
         finally:
+            job_queue.record_heartbeat(worker_name, "ONLINE")
             job_queue.task_done()
 
 
@@ -1178,29 +1321,28 @@ def health() -> dict[str, str]:
 
 
 @app.get("/ready")
-def readiness() -> dict[str, str]:
-    """Readiness check - verifies system is ready to receive traffic"""
+def readiness() -> dict[str, object]:
+    """Readiness check - verifies database, redis queue, and worker readiness."""
+    db_ok = False
     try:
-        # Check database connection
         with closing(connect()) as connection:
             connection.execute("SELECT 1").fetchone()
-        
-        # Check worker thread is running (would need to add a flag for this)
-        worker_status = "running" if threading.active_count() > 1 else "starting"
-        
-        logger.info("Readiness check: ready")
-        return {
-            "status": "ready",
-            "database": "ok",
-            "worker": worker_status
-        }
-    except Exception as e:
-        logger.error(f"Readiness check failed: {e}")
-        return {
-            "status": "not_ready",
-            "database": "error",
-            "worker": "error"
-        }
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    active_workers = job_queue.get_active_workers(max_age_seconds=45.0)
+    has_workers = len(active_workers) > 0 or (threading.active_count() > 1)
+    redis_ok = job_queue._redis is not None
+
+    is_ready = db_ok and has_workers
+    return {
+        "status": "ready" if is_ready else "not_ready",
+        "database": "ok" if db_ok else "error",
+        "redis": "connected" if redis_ok else "offline_or_local_fallback",
+        "worker": "running" if has_workers else "starting",
+        "active_workers": len(active_workers),
+    }
 
 
 @app.post("/referrals", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])

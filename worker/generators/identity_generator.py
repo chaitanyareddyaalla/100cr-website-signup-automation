@@ -10,7 +10,7 @@ def generate_test_identity(index: int) -> TestIdentity:
     return TestIdentity(
         account_id=f"TEST{index:03d}",
         name=f"Test User {index}",
-        test_id=f"mock-{index:03d}",
+        test_id=f"ident-{index:04d}",
         phone=generate_phone(index),
     )
 

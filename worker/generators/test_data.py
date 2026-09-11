@@ -33,7 +33,7 @@ def generate_identity(index: int, referral: str = "") -> TestIdentity:
     return TestIdentity(
         account_id=f"TEST{index:03d}",
         name=DEFAULT_STATIC_NAME,
-        test_id=f"mock-{index:03d}",
+        test_id=f"ident-{index:04d}",
         phone=generate_phone(index),
         password=DEFAULT_STATIC_PASSWORD,
         place=DEFAULT_STATIC_PLACE,

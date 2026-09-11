@@ -17,14 +17,11 @@ services:
       - "8000:8000"
     environment:
       APP_ENV: ${APP_ENV:-development}
-      AUTOMATION_MODE: ${AUTOMATION_MODE:-mock}
+      AUTOMATION_MODE: ${AUTOMATION_MODE:-live}
       DATABASE_URL: ${DATABASE_URL:-postgresql://task_automation:change-me-local-only@postgres:5432/task_automation}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       EMBEDDED_WORKER: "false"
       FRONTEND_ORIGIN: http://localhost:5173
-      GOOGLE_SHEETS_ID: ${GOOGLE_SHEETS_ID:-}
-      GOOGLE_SHEETS_WORKSHEET: ${GOOGLE_SHEETS_WORKSHEET:-Results}
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${GOOGLE_SERVICE_ACCOUNT_JSON:-}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -36,7 +33,7 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       APP_ENV: ${APP_ENV:-development}
-      AUTOMATION_MODE: ${AUTOMATION_MODE:-mock}
+      AUTOMATION_MODE: ${AUTOMATION_MODE:-live}
       DATABASE_URL: ${DATABASE_URL:-postgresql://task_automation:change-me-local-only@postgres:5432/task_automation}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       WORKER_ID: worker-1

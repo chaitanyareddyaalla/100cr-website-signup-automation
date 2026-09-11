@@ -31,7 +31,3 @@ class SignupResult:
     @classmethod
     def limit_reached(cls, account_id: str, error: str = "Referral code maximum limit reached", phone: str = "", attempts: int = 1) -> "SignupResult":
         return cls(account_id=account_id, status="LIMIT_REACHED", error=error, phone=phone, attempts=attempts)
-
-
-def run_mock_signup(identity: TestIdentity) -> SignupResult:
-    return SignupResult.success(identity.account_id)
