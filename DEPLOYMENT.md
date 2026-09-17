@@ -60,6 +60,12 @@ GOOGLE_SHEETS_ID=your-spreadsheet-id
 GOOGLE_SHEETS_WORKSHEET=Results
 GOOGLE_SERVICE_ACCOUNT_JSON=/etc/secrets/google-service-account.json
 WORKER_ID=render-worker-1
+
+# Memory optimization for 512MB RAM tier:
+CONCURRENT_WORKERS=1
+SIGNUP_CONCURRENCY=5
+MAX_PARALLEL_SIGNUPS=10
+MALLOC_ARENA_MAX=2
 ```
 
 Optional (for additional CORS origins):

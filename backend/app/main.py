@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import os
+
+# Limit glibc memory arena allocations in Linux/Docker containers early
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
 import asyncio
+from collections import deque
+import gc
 import csv
 import io
 import json
@@ -294,8 +301,34 @@ rate_limit_lock = threading.Lock()
 request_windows: dict[str, list[float]] = {}
 known_account_ids: set[str] = set()
 known_test_numbers: set[str] = set()
+
+_RECENT_PHONES_MAX = 5000
+_recent_phones_deque: deque[str] = deque(maxlen=_RECENT_PHONES_MAX)
 global_used_phones: set[str] = set()
 _phone_lock = threading.Lock()
+
+
+def trim_memory() -> None:
+    """Trigger Python garbage collection and advise glibc to release unused heap pages to the OS."""
+    try:
+        gc.collect()
+        if hasattr(os, "uname") and os.uname().sysname == "Linux":
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def checkpoint_wal() -> None:
+    """Passively checkpoint WAL file so -wal and memory-mapped pages remain small."""
+    try:
+        with closing(connect()) as connection:
+            connection.execute("PRAGMA wal_checkpoint(PASSIVE);")
+    except Exception:
+        pass
 
 
 def now() -> str:
@@ -319,7 +352,7 @@ def with_write_retry(fn, max_attempts: int = 10):
 def acquire_signup_slot() -> None:
     global _signup_in_flight
     while True:
-        cap = max(10, int(os.getenv("MAX_PARALLEL_SIGNUPS", "100")))
+        cap = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "10")), 20))
         with _signup_slot_lock:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
@@ -345,6 +378,9 @@ def connect() -> sqlite3.Connection:
     try:
         connection.execute("PRAGMA busy_timeout = 60000;")
         connection.execute("PRAGMA synchronous = NORMAL;")
+        connection.execute("PRAGMA cache_size = -1000;")
+        connection.execute("PRAGMA mmap_size = 0;")
+        connection.execute("PRAGMA temp_store = FILE;")
     except Exception:
         pass
     return connection
@@ -477,7 +513,11 @@ def publish(batch_id: str, batch: dict) -> None:
         try:
             subscriber.put_nowait(batch)
         except Exception:
-            continue
+            try:
+                subscriber.get_nowait()
+                subscriber.put_nowait(batch)
+            except Exception:
+                continue
 
 
 def publish_retry(batch_id: str, retry: int, error: str = "") -> None:
@@ -653,7 +693,11 @@ def record_success(batch_id: str, account_id: str, test_id: str) -> dict | None:
 
     if with_write_retry(_do) != 1:
         return None
+    if len(known_account_ids) > 1000:
+        known_account_ids.clear()
     known_account_ids.add(account_id)
+    if len(known_test_numbers) > 1000:
+        known_test_numbers.clear()
     known_test_numbers.add(test_id)
     finalize_identity(test_id, "COMPLETED", batch_id)
     batch = get_batch(batch_id)
@@ -735,12 +779,19 @@ def load_used_phones() -> None:
     try:
         with closing(connect()) as connection:
             rows = connection.execute(
-                "SELECT phone FROM used_phone_numbers ORDER BY rowid DESC LIMIT 100000"
+                "SELECT phone FROM used_phone_numbers ORDER BY rowid DESC LIMIT 5000"
             ).fetchall()
-            for r in rows:
-                p = r["phone"]
-                if p:
-                    global_used_phones.add(p)
+            with _phone_lock:
+                if not global_used_phones and _recent_phones_deque:
+                    _recent_phones_deque.clear()
+                for r in rows:
+                    p = r["phone"]
+                    if p and p not in global_used_phones:
+                        if len(_recent_phones_deque) >= _recent_phones_deque.maxlen:
+                            oldest = _recent_phones_deque.popleft()
+                            global_used_phones.discard(oldest)
+                        _recent_phones_deque.append(p)
+                        global_used_phones.add(p)
         logger.info(f"Loaded {len(global_used_phones)} recent phone numbers into memory")
     except Exception as e:
         logger.warning(f"Could not load used phone numbers: {e}")
@@ -750,13 +801,17 @@ def claim_unique_phone(batch_id: str) -> str:
     """Generate a fast, unique 10-digit phone number avoiding collisions."""
     global global_used_phones
     with _phone_lock:
-        if len(global_used_phones) > 300000:
-            global_used_phones = set(list(global_used_phones)[-100000:])
+        if not global_used_phones and _recent_phones_deque:
+            _recent_phones_deque.clear()
         candidate = generate_phone()
         for _ in range(50):
             if candidate not in global_used_phones:
                 break
             candidate = generate_phone()
+        if len(_recent_phones_deque) >= _recent_phones_deque.maxlen:
+            oldest = _recent_phones_deque.popleft()
+            global_used_phones.discard(oldest)
+        _recent_phones_deque.append(candidate)
         global_used_phones.add(candidate)
 
     # Best-effort record for logging without blocking the worker
@@ -973,8 +1028,8 @@ def process_batch(batch_id: str) -> None:
         concurrency = max(
             1,
             min(
-                int(os.getenv("SIGNUP_CONCURRENCY", "20")),
-                int(os.getenv("MAX_PARALLEL_SIGNUPS", "40")),
+                int(os.getenv("SIGNUP_CONCURRENCY", "5")),
+                int(os.getenv("MAX_PARALLEL_SIGNUPS", "10")),
             ),
         )
         limit_reached_event = threading.Event()
@@ -1185,6 +1240,8 @@ def process_batch(batch_id: str) -> None:
         except Exception:
             pass
         cleanup_worker_events(batch_id)
+        checkpoint_wal()
+        trim_memory()
 
 
 def worker_loop(worker_name: str = "worker-1") -> None:
@@ -1217,6 +1274,7 @@ def worker_loop(worker_name: str = "worker-1") -> None:
         finally:
             job_queue.record_heartbeat(worker_name, "ONLINE")
             job_queue.task_done()
+            trim_memory()
 
 
 app = FastAPI(title="Signup Automation API", version="1.0.0")
@@ -1262,6 +1320,10 @@ async def rate_limit(request: Request, call_next):
     client = request.client.host if request.client else "unknown"
     cutoff = time.monotonic() - 60
     with rate_limit_lock:
+        if len(request_windows) > 500:
+            stale_keys = [k for k, stamps in request_windows.items() if not stamps or stamps[-1] < cutoff]
+            for k in stale_keys:
+                request_windows.pop(k, None)
         window = [stamp for stamp in request_windows.get(client, []) if stamp >= cutoff]
         if len(window) >= limit:
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
@@ -1290,7 +1352,7 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = max(4, min(int(os.getenv("CONCURRENT_WORKERS", "8")), 10))
+    num_workers = max(1, min(int(os.getenv("CONCURRENT_WORKERS", "1")), 10))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,
@@ -1438,16 +1500,21 @@ def stop_batch(batch_id: str) -> dict:
 
 
 @app.get("/batches/{batch_id}/events", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
-async def batch_events(batch_id: str) -> StreamingResponse:
+async def batch_events(batch_id: str, request: Request = None) -> StreamingResponse:
     get_batch(batch_id)
-    updates: Queue[dict] = Queue()
+    updates: Queue[dict] = Queue(maxsize=10)
     with state_lock:
         subscribers.setdefault(batch_id, []).append(updates)
 
     async def stream() -> AsyncGenerator[str, None]:
         try:
-            updates.put(get_batch(batch_id))
+            try:
+                updates.put_nowait(get_batch(batch_id))
+            except Exception:
+                pass
             while True:
+                if request is not None and await request.is_disconnected():
+                    break
                 try:
                     batch = await asyncio.to_thread(updates.get, True, 0.5)
                     yield f"data: {json.dumps(batch)}\n\n"
@@ -1461,7 +1528,7 @@ async def batch_events(batch_id: str) -> StreamingResponse:
                 queue_list = subscribers.get(batch_id)
                 if queue_list and updates in queue_list:
                     queue_list.remove(updates)
-                if queue_list == []:
+                if not queue_list:
                     subscribers.pop(batch_id, None)
 
     headers = {
