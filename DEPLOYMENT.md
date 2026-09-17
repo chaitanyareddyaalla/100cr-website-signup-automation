@@ -61,10 +61,10 @@ GOOGLE_SHEETS_WORKSHEET=Results
 GOOGLE_SERVICE_ACCOUNT_JSON=/etc/secrets/google-service-account.json
 WORKER_ID=render-worker-1
 
-# Memory optimization for 512MB RAM tier:
+# High-throughput settings optimized for 512MB RAM tier:
 CONCURRENT_WORKERS=1
-SIGNUP_CONCURRENCY=5
-MAX_PARALLEL_SIGNUPS=10
+SIGNUP_CONCURRENCY=12
+MAX_PARALLEL_SIGNUPS=16
 MALLOC_ARENA_MAX=2
 ```
 

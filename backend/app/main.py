@@ -117,9 +117,9 @@ class BatchResponse(BaseModel):
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
 MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "2.0"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
-MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "15.0"))
+MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "3.0"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
@@ -352,7 +352,7 @@ def with_write_retry(fn, max_attempts: int = 10):
 def acquire_signup_slot() -> None:
     global _signup_in_flight
     while True:
-        cap = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "10")), 20))
+        cap = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")), 25))
         with _signup_slot_lock:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
@@ -1028,8 +1028,8 @@ def process_batch(batch_id: str) -> None:
         concurrency = max(
             1,
             min(
-                int(os.getenv("SIGNUP_CONCURRENCY", "5")),
-                int(os.getenv("MAX_PARALLEL_SIGNUPS", "10")),
+                int(os.getenv("SIGNUP_CONCURRENCY", "12")),
+                int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")),
             ),
         )
         limit_reached_event = threading.Event()
@@ -1141,7 +1141,7 @@ def process_batch(batch_id: str) -> None:
             finally:
                 release_signup_slot()
 
-        def drain(pending: set, timeout: float | None = 0.2) -> set:
+        def drain(pending: set, timeout: float | None = 0.05) -> set:
             if not pending:
                 return pending
             done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
