@@ -349,15 +349,20 @@ def with_write_retry(fn, max_attempts: int = 10):
             time.sleep(0.01 * (1.5 ** attempt))
 
 
+def get_max_device_concurrency() -> int:
+    val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or "3"
+    return max(1, min(int(val), 5))
+
+
 def acquire_signup_slot() -> None:
     global _signup_in_flight
     while True:
-        cap = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")), 25))
+        cap = get_max_device_concurrency()
         with _signup_slot_lock:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
                 return
-        time.sleep(0.01)
+        time.sleep(0.005)
 
 
 def release_signup_slot() -> None:
@@ -1025,13 +1030,7 @@ def process_batch(batch_id: str) -> None:
         hb_thread.start()
 
         max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "500"))
-        concurrency = max(
-            1,
-            min(
-                int(os.getenv("SIGNUP_CONCURRENCY", "12")),
-                int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")),
-            ),
-        )
+        concurrency = get_max_device_concurrency()
         limit_reached_event = threading.Event()
         circuit_event = threading.Event()
         fail_lock = threading.Lock()
@@ -1352,7 +1351,7 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = max(1, min(int(os.getenv("CONCURRENT_WORKERS", "1")), 10))
+    num_workers = max(1, min(int(os.getenv("CONCURRENT_WORKERS", "3")), 5))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,

@@ -6,10 +6,12 @@ from typing import Protocol
 
 try:
     from ..automation.browser_manager import BrowserManager
+    from ..automation.device_manager import IsolatedDeviceTask
     from ..generators.test_data import TestIdentity
     from ..automation.signup_flow import SignupResult
 except ImportError:
     from automation.browser_manager import BrowserManager
+    from automation.device_manager import IsolatedDeviceTask
     from generators.test_data import TestIdentity
     from automation.signup_flow import SignupResult
 
@@ -51,9 +53,9 @@ def _http_pool():
         if _HTTP_POOL is None:
             import urllib3
 
-            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")), 25))
+            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "5")), 10))
             _HTTP_POOL = urllib3.PoolManager(
-                num_pools=4,
+                num_pools=2,
                 maxsize=maxsize,
                 timeout=urllib3.Timeout(connect=3.0, read=8.0),
                 retries=False,
@@ -66,9 +68,8 @@ class SignupAdapter(Protocol):
         ...
 
 
-
 class AuthorizedPlaywrightAdapter:
-    """Live automation adapter supporting direct API registration and Playwright browser signup."""
+    """Live automation adapter supporting direct API registration and isolated temporary Playwright device signups."""
 
     def __init__(self, base_url: str | None = None, timeout_ms: int = 15_000) -> None:
         self.base_url = (
@@ -150,32 +151,21 @@ class AuthorizedPlaywrightAdapter:
         return SignupResult.failure(identity.account_id, error=clean_msg or f"HTTP {http_status}", phone=identity.phone)
 
     def _browser_signup(self, identity: TestIdentity) -> SignupResult:
-        try:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
-        except ImportError as exc:
-            raise RuntimeError("Install Playwright before enabling browser automation") from exc
-
         signup_url = os.getenv("SIGNUP_PAGE_URL", "https://www.100crorescompany.com/signup")
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                context = browser.new_context()
-                try:
-                    page = context.new_page()
-                    page.set_default_timeout(self.timeout_ms)
-                    page.goto(signup_url, wait_until="networkidle", timeout=self.timeout_ms)
-                    page.fill("#name", identity.name or "Chaitanya Reddy")
-                    page.fill("#phone", identity.phone)
-                    page.fill("#place", identity.place or "Hyderabad")
-                    page.fill("#password", identity.password or "SecurePass@123")
-                    page.fill("#referralCode", identity.referral)
-                    page.click("button[type='submit']")
-                    page.wait_for_timeout(2000)
-                    return SignupResult.success(identity.account_id, phone=identity.phone)
-                finally:
-                    context.close()
-                    browser.close()
-        except PlaywrightTimeoutError:
-            return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
+            with IsolatedDeviceTask(timeout_ms=self.timeout_ms) as device:
+                page = device.page
+                page.goto(signup_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                page.fill("#name", identity.name or "Chaitanya Reddy")
+                page.fill("#phone", identity.phone)
+                page.fill("#place", identity.place or "Hyderabad")
+                page.fill("#password", identity.password or "SecurePass@123")
+                page.fill("#referralCode", identity.referral)
+                page.click("button[type='submit']")
+                page.wait_for_timeout(2000)
+                return SignupResult.success(identity.account_id, phone=identity.phone)
         except Exception as exc:
+            err_str = str(exc)
+            if "Timeout" in type(exc).__name__ or "timeout" in err_str.lower():
+                return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
             return SignupResult.failure(identity.account_id, error=f"SITE_ERROR: {exc}", phone=identity.phone)
