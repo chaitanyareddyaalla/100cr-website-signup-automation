@@ -125,6 +125,7 @@ WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
 _signup_slot_lock = threading.Lock()
 _signup_in_flight = 0
+_task_execution_lock = threading.Lock()
 _export_queue: Queue[dict | None] = Queue()
 _export_started = threading.Event()
 _export_init_lock = threading.Lock()
@@ -1260,20 +1261,25 @@ def worker_loop(worker_name: str = "worker-1") -> None:
                     logger.info(f"[{worker_name}] Recovered {recovered} abandoned jobs")
             except Exception:
                 pass
-        try:
-            batch_id = job_queue.get(timeout=0.5)
-        except Empty:
+        if not _task_execution_lock.acquire(timeout=0.2):
             continue
         try:
-            job_queue.record_heartbeat(worker_name, "BUSY")
-            process_batch(batch_id)
-        except Exception as e:
-            logger.error(f"Error in {worker_name} for batch {batch_id}: {e}", exc_info=True)
-            cleanup_worker_events(batch_id)
+            try:
+                batch_id = job_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                job_queue.record_heartbeat(worker_name, "BUSY")
+                process_batch(batch_id)
+            except Exception as e:
+                logger.error(f"Error in {worker_name} for batch {batch_id}: {e}", exc_info=True)
+                cleanup_worker_events(batch_id)
+            finally:
+                job_queue.record_heartbeat(worker_name, "ONLINE")
+                job_queue.task_done()
+                trim_memory()
         finally:
-            job_queue.record_heartbeat(worker_name, "ONLINE")
-            job_queue.task_done()
-            trim_memory()
+            _task_execution_lock.release()
 
 
 app = FastAPI(title="Signup Automation API", version="1.0.0")
@@ -1351,7 +1357,8 @@ def startup() -> None:
     if os.getenv("EMBEDDED_WORKER", "true").lower() != "true":
         logger.info("Embedded worker disabled; expecting a separate worker service")
         return
-    num_workers = max(1, min(int(os.getenv("CONCURRENT_WORKERS", "3")), 5))
+    worker_env = os.getenv("CONCURRENT_WORKERS") or os.getenv("WORKER_CONCURRENCY") or "1"
+    num_workers = max(1, min(int(worker_env), 5))
     for i in range(num_workers):
         worker_thread = threading.Thread(
             target=worker_loop,
@@ -1360,7 +1367,7 @@ def startup() -> None:
             name=f"worker-{i+1}",
         )
         worker_thread.start()
-    logger.info(f"Startup complete with {num_workers} concurrent background workers")
+    logger.info(f"Startup complete with {num_workers} background worker(s)")
 
 
 @app.get("/")

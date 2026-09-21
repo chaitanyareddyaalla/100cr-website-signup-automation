@@ -62,7 +62,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON=/etc/secrets/google-service-account.json
 WORKER_ID=render-worker-1
 
 # Controlled multi-device concurrency settings for 512MB RAM tier:
-CONCURRENT_WORKERS=3
+CONCURRENT_WORKERS=1
 SIGNUP_CONCURRENCY=3
 MAX_PARALLEL_SIGNUPS=3
 MAX_CONCURRENT_DEVICES=3

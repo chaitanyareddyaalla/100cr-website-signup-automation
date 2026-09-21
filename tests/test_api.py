@@ -469,6 +469,48 @@ def test_worker_loop_processes_queued_batch(monkeypatch) -> None:
     assert result["successful"] == 2
 
 
+def test_only_one_task_runs_at_once_remaining_in_queue(monkeypatch) -> None:
+    batch1 = backend_main.create_batch("QUEUE_ORDER_1")
+    batch2 = backend_main.create_batch("QUEUE_ORDER_2")
+    update_batch(batch1["id"], target=2)
+    update_batch(batch2["id"], target=2)
+
+    batch1_started = threading.Event()
+    batch2_verified_queued = threading.Event()
+
+    def mock_signup(identity):
+        if identity.referral == "QUEUE_ORDER_1":
+            batch1_started.set()
+            # While batch 1 is processing, batch 2 must remain in QUEUED status
+            b2_status = backend_main.get_batch(batch2["id"])["status"]
+            assert b2_status == "QUEUED", f"Expected batch 2 to be QUEUED, got {b2_status}"
+            batch2_verified_queued.set()
+        return type("Result", (), {"status": "SUCCESS", "account_id": identity.account_id})()
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", mock_signup)
+
+    backend_main.pause_events[batch1["id"]] = threading.Event()
+    backend_main.stop_events[batch1["id"]] = threading.Event()
+    backend_main.transition_batch(batch1["id"], "QUEUED", "test")
+    backend_main.job_queue.put(batch1["id"])
+
+    backend_main.pause_events[batch2["id"]] = threading.Event()
+    backend_main.stop_events[batch2["id"]] = threading.Event()
+    backend_main.transition_batch(batch2["id"], "QUEUED", "test")
+    backend_main.job_queue.put(batch2["id"])
+
+    # Start 1 worker thread (as configured by CONCURRENT_WORKERS=1)
+    worker = threading.Thread(target=backend_main.worker_loop, daemon=True)
+    worker.start()
+
+    wait_for_status(batch1["id"], "COMPLETED")
+    wait_for_status(batch2["id"], "COMPLETED")
+
+    assert batch2_verified_queued.is_set(), "Batch 2 was not verified as QUEUED while Batch 1 was running"
+    assert backend_main.get_batch(batch1["id"])["status"] == "COMPLETED"
+    assert backend_main.get_batch(batch2["id"])["status"] == "COMPLETED"
+
+
 def test_progress_metrics_are_consistent() -> None:
     batch = backend_main.create_batch("PROGRESS_TEST")
     update_batch(batch["id"], target=0)
