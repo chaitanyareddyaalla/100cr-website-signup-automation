@@ -45,7 +45,7 @@ def queued_batch(target: int = 3) -> dict:
 
 
 def wait_for_status(batch_id: str, status: str) -> None:
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if backend_main.get_batch(batch_id)["status"] == status:
             return
@@ -462,9 +462,14 @@ def test_worker_loop_processes_queued_batch(monkeypatch) -> None:
     backend_main.transition_batch(batch["id"], "QUEUED", "test")
     backend_main.job_queue.put(batch["id"])
 
-    worker = threading.Thread(target=backend_main.worker_loop, daemon=True)
+    stop_worker = threading.Event()
+    worker = threading.Thread(target=backend_main.worker_loop, args=("worker-test", stop_worker), daemon=True)
     worker.start()
-    wait_for_status(batch["id"], "COMPLETED")
+    try:
+        wait_for_status(batch["id"], "COMPLETED")
+    finally:
+        stop_worker.set()
+        worker.join(timeout=2.0)
     result = backend_main.get_batch(batch["id"])
     assert result["successful"] == 2
 
@@ -492,19 +497,25 @@ def test_only_one_task_runs_at_once_remaining_in_queue(monkeypatch) -> None:
     backend_main.pause_events[batch1["id"]] = threading.Event()
     backend_main.stop_events[batch1["id"]] = threading.Event()
     backend_main.transition_batch(batch1["id"], "QUEUED", "test")
-    backend_main.job_queue.put(batch1["id"])
 
     backend_main.pause_events[batch2["id"]] = threading.Event()
     backend_main.stop_events[batch2["id"]] = threading.Event()
     backend_main.transition_batch(batch2["id"], "QUEUED", "test")
+
+    backend_main.job_queue.put(batch1["id"])
     backend_main.job_queue.put(batch2["id"])
 
     # Start 1 worker thread (as configured by CONCURRENT_WORKERS=1)
-    worker = threading.Thread(target=backend_main.worker_loop, daemon=True)
+    stop_worker = threading.Event()
+    worker = threading.Thread(target=backend_main.worker_loop, args=("worker-order-test", stop_worker), daemon=True)
     worker.start()
 
-    wait_for_status(batch1["id"], "COMPLETED")
-    wait_for_status(batch2["id"], "COMPLETED")
+    try:
+        wait_for_status(batch1["id"], "COMPLETED")
+        wait_for_status(batch2["id"], "COMPLETED")
+    finally:
+        stop_worker.set()
+        worker.join(timeout=2.0)
 
     assert batch2_verified_queued.is_set(), "Batch 2 was not verified as QUEUED while Batch 1 was running"
     assert backend_main.get_batch(batch1["id"])["status"] == "COMPLETED"

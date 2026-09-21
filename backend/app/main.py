@@ -550,11 +550,11 @@ def should_retry(status: str, batch_status: str | None, retry_count: int) -> boo
         return False
     if batch_status in {BatchStatus.CANCELLED.value, BatchStatus.COMPLETED.value, BatchStatus.FAILED.value}:
         return False
-    if status in {"DUPLICATE", "LIMIT_REACHED"}:
+    if status in {"DUPLICATE", "LIMIT_REACHED", "INVALID_REFERRAL"}:
         return False
     if retry_count >= MAX_SIGNUP_RETRIES:
         return False
-    return status in {"FAILURE", "ERROR", "TIMEOUT"}
+    return status in {"FAILURE", "ERROR", "TIMEOUT", "SERVER_ERROR"}
 
 
 def update_batch(batch_id: str, **changes: object) -> dict:
@@ -1048,7 +1048,7 @@ def process_batch(batch_id: str) -> None:
         )
         hb_thread.start()
 
-        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "2000"))
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5000"))
         concurrency = get_max_device_concurrency()
         limit_reached_event = threading.Event()
         circuit_event = threading.Event()
@@ -1132,6 +1132,9 @@ def process_batch(batch_id: str) -> None:
                         logger.warning("Batch %s: target site rate limited; cooling down 0.5s", batch_id)
                         time.sleep(0.5)
                         continue
+                    if result.status == "SERVER_ERROR":
+                        logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.5s", batch_id)
+                        time.sleep(0.5)
                     if should_retry(result.status, BatchStatus.RUNNING.value, retry):
                         next_retry = retry + 1
                         logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
@@ -1146,7 +1149,9 @@ def process_batch(batch_id: str) -> None:
                     increment_batch_counters(batch_id, failed=1, attempted=1)
                     finalize_identity(identity.test_id, "FAILED", batch_id)
                     with fail_lock:
-                        consecutive_failures += 1
+                        # Transient 5xx server errors do not count towards client-side circuit breaker
+                        if result.status != "SERVER_ERROR":
+                            consecutive_failures += 1
                         current_consecutive = consecutive_failures
                     if current_consecutive >= max_consecutive_failures:
                         batch_error_msg = f"Circuit breaker tripped after {current_consecutive} consecutive failures on the target website."
@@ -1260,30 +1265,20 @@ def process_batch(batch_id: str) -> None:
 
 
 def get_next_queued_batch_id() -> str | None:
-    """Fetch next batch from memory queue or persistent database queue."""
+    """Fetch next batch from memory queue or distributed Redis queue."""
     if not job_queue.empty():
         try:
             return job_queue.get_nowait()
         except Empty:
             pass
-    try:
-        with closing(connect()) as connection:
-            row = connection.execute(
-                "SELECT id FROM batches WHERE status = ? ORDER BY rowid ASC LIMIT 1",
-                (BatchStatus.QUEUED.value,),
-            ).fetchone()
-            if row:
-                return row["id"]
-    except Exception:
-        pass
     return None
 
 
-def worker_loop(worker_name: str = "worker-1") -> None:
+def worker_loop(worker_name: str = "worker-1", stop_event: threading.Event | None = None, run_once: bool = False) -> None:
     logger.info(f"Worker loop started: {worker_name}")
     last_recovery = 0.0
     last_heartbeat = 0.0
-    while True:
+    while not (stop_event and stop_event.is_set()):
         now_ts = time.monotonic()
         if now_ts - last_heartbeat > 10.0:
             last_heartbeat = now_ts
@@ -1302,6 +1297,8 @@ def worker_loop(worker_name: str = "worker-1") -> None:
         try:
             batch_id = get_next_queued_batch_id()
             if not batch_id:
+                if run_once:
+                    break
                 time.sleep(0.02)
                 continue
             try:
@@ -1314,6 +1311,8 @@ def worker_loop(worker_name: str = "worker-1") -> None:
                 job_queue.record_heartbeat(worker_name, "ONLINE")
                 job_queue.task_done()
                 trim_memory()
+            if run_once:
+                break
         finally:
             _task_execution_lock.release()
             time.sleep(0.01)

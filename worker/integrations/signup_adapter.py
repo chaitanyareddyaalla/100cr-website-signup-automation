@@ -24,14 +24,15 @@ _DUPLICATE_MARKERS = (
     "already registered",
     "already exist",
     "already used",
+    "phone number already",
     "phone already",
     "number already",
-    "duplicate",
-    "exists",
-    "registered",
-    "taken",
+    "mobile already",
+    "mobile number already",
     "user already",
     "account already",
+    "duplicate entry",
+    "duplicate phone",
 )
 _LIMIT_MARKERS = (
     "maximum limit",
@@ -54,10 +55,11 @@ def _http_pool():
             import urllib3
 
             maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "35")), 50))
+            read_timeout = float(os.getenv("SIGNUP_TIMEOUT_SECONDS", "20.0"))
             _HTTP_POOL = urllib3.PoolManager(
                 num_pools=8,
                 maxsize=maxsize,
-                timeout=urllib3.Timeout(connect=3.0, read=8.0),
+                timeout=urllib3.Timeout(connect=4.0, read=read_timeout),
                 retries=False,
             )
         return _HTTP_POOL
@@ -84,6 +86,7 @@ class AuthorizedPlaywrightAdapter:
         return self._api_signup(identity)
 
     def _api_signup(self, identity: TestIdentity) -> SignupResult:
+        import time
         import urllib3
 
         payload = json.dumps(
@@ -107,6 +110,22 @@ class AuthorizedPlaywrightAdapter:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 },
             )
+            # Cloudflare 525 SSL handshake is often an ephemeral glitch; perform a fast single retry
+            if resp.status == 525:
+                time.sleep(0.25)
+                try:
+                    resp = _http_pool().request(
+                        "POST",
+                        endpoint,
+                        body=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        },
+                    )
+                except Exception:
+                    pass
+
             if 200 <= resp.status < 300:
                 return SignupResult.success(identity.account_id, phone=identity.phone)
             body = (resp.data or b"").decode("utf-8", errors="replace")
@@ -126,6 +145,14 @@ class AuthorizedPlaywrightAdapter:
         except Exception:
             pass
 
+        # 5xx / Cloudflare errors must be classified as SERVER_ERROR first, never as DUPLICATE or SKIPPED
+        if 500 <= http_status < 600 or "error code: 525" in body_lower or "ssl handshake failed" in body_lower:
+            return SignupResult(
+                account_id=identity.account_id,
+                status="SERVER_ERROR",
+                error=clean_msg or f"Server error {http_status}",
+                phone=identity.phone,
+            )
         if http_status == 429 or "too many requests" in body_lower or "rate limit" in body_lower:
             return SignupResult(
                 account_id=identity.account_id,
@@ -146,13 +173,6 @@ class AuthorizedPlaywrightAdapter:
                 account_id=identity.account_id,
                 status="INVALID_REFERRAL",
                 error=clean_msg or "Invalid referral code",
-                phone=identity.phone,
-            )
-        if 500 <= http_status < 600:
-            return SignupResult(
-                account_id=identity.account_id,
-                status="SERVER_ERROR",
-                error=clean_msg or f"Server error {http_status}",
                 phone=identity.phone,
             )
         return SignupResult.failure(identity.account_id, error=clean_msg or f"HTTP {http_status}", phone=identity.phone)
