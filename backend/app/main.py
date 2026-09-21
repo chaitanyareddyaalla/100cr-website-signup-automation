@@ -352,9 +352,9 @@ def with_write_retry(fn, max_attempts: int = 10):
 
 def get_max_device_concurrency() -> int:
     use_browser = os.getenv("USE_BROWSER", "false").lower() in ("true", "1")
-    default_val = "3" if use_browser else "12"
+    default_val = "5" if use_browser else "30"
     val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or default_val
-    max_cap = 5 if use_browser else 25
+    max_cap = 10 if use_browser else 50
     return max(1, min(int(val), max_cap))
 
 
@@ -366,7 +366,7 @@ def acquire_signup_slot() -> None:
             if _signup_in_flight < cap:
                 _signup_in_flight += 1
                 return
-        time.sleep(0.005)
+        time.sleep(0.001)
 
 
 def release_signup_slot() -> None:
@@ -772,6 +772,8 @@ def reserve_identity(identifier: str, batch_id: str) -> bool:
 
 def mark_identity_processing(identifier: str, batch_id: str) -> None:
     """Move identity state from RESERVED to PROCESSING."""
+    if _has_authorized_identities is False:
+        return
     with closing(connect()) as connection:
         connection.execute(
             "UPDATE authorized_test_identities SET status = 'PROCESSING' WHERE identifier = ? AND batch_id = ?",
@@ -782,6 +784,8 @@ def mark_identity_processing(identifier: str, batch_id: str) -> None:
 
 def finalize_identity(identifier: str, status: str, batch_id: str) -> None:
     """Finalize identity with SUCCESS, FAILED, or SKIPPED."""
+    if _has_authorized_identities is False:
+        return
     with closing(connect()) as connection:
         connection.execute(
             "UPDATE authorized_test_identities SET status = ?, used_at = ?, batch_id = ? WHERE identifier = ?",
@@ -1059,15 +1063,9 @@ def process_batch(batch_id: str) -> None:
             try:
                 if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
                     return
-                current = get_batch(batch_id)
-                if current["status"] != BatchStatus.RUNNING.value:
-                    return
                 mark_identity_processing(identity.test_id, batch_id)
                 for retry in range(MAX_SIGNUP_RETRIES + 1):
                     if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
-                        return
-                    current = get_batch(batch_id)
-                    if current["status"] != BatchStatus.RUNNING.value:
                         return
                     try:
                         result = run_signup(identity)
@@ -1123,14 +1121,14 @@ def process_batch(batch_id: str) -> None:
                             "password": getattr(identity, "password", ""),
                             "place": getattr(identity, "place", ""),
                             "language": getattr(identity, "language", ""),
-                            "referral": current.get("referral", ""),
+                            "referral": identity.referral,
                             "batch_id": batch_id,
                             "status": "SKIPPED",
                             "error": getattr(result, "error", "") or "Duplicate account skipped",
                             "created_at": getattr(result, "timestamp", now()),
                         })
                         return
-                    if should_retry(result.status, current["status"], retry):
+                    if should_retry(result.status, BatchStatus.RUNNING.value, retry):
                         next_retry = retry + 1
                         logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
                         increment_batch_counters(batch_id, retries=1, attempted=1)
@@ -1155,7 +1153,7 @@ def process_batch(batch_id: str) -> None:
             finally:
                 release_signup_slot()
 
-        def drain(pending: set, timeout: float | None = 0.05) -> set:
+        def drain(pending: set, timeout: float | None = 0.01) -> set:
             if not pending:
                 return pending
             done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
@@ -1274,11 +1272,14 @@ def worker_loop(worker_name: str = "worker-1") -> None:
                     logger.info(f"[{worker_name}] Recovered {recovered} abandoned jobs")
             except Exception:
                 pass
-        if not _task_execution_lock.acquire(timeout=0.2):
+        if job_queue.empty():
+            time.sleep(0.02)
+            continue
+        if not _task_execution_lock.acquire(timeout=0.05):
             continue
         try:
             try:
-                batch_id = job_queue.get(timeout=0.2)
+                batch_id = job_queue.get_nowait()
             except Empty:
                 continue
             try:
