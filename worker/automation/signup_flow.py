@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 try:
     from ..generators.test_data import TestIdentity
 except ImportError:
-    from generators.test_data import TestIdentity
+    from worker.generators.test_data import TestIdentity
 
 
 @dataclass(frozen=True)

@@ -10,10 +10,10 @@ try:
     from ..generators.test_data import TestIdentity
     from ..automation.signup_flow import SignupResult
 except ImportError:
-    from automation.browser_manager import BrowserManager
-    from automation.device_manager import IsolatedDeviceTask
-    from generators.test_data import TestIdentity
-    from automation.signup_flow import SignupResult
+    from worker.automation.browser_manager import BrowserManager
+    from worker.automation.device_manager import IsolatedDeviceTask
+    from worker.generators.test_data import TestIdentity
+    from worker.automation.signup_flow import SignupResult
 
 logger = logging.getLogger(__name__)
 
