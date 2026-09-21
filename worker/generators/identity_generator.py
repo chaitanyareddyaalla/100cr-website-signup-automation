@@ -2,8 +2,8 @@ try:
     from .phone_generator import generate_phone
     from .test_data import TestIdentity
 except ImportError:
-    from generators.phone_generator import generate_phone
-    from generators.test_data import TestIdentity
+    from worker.generators.phone_generator import generate_phone
+    from worker.generators.test_data import TestIdentity
 
 
 def generate_test_identity(index: int) -> TestIdentity:

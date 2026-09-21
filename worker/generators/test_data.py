@@ -4,10 +4,7 @@ from dataclasses import dataclass
 try:
     from .phone_generator import generate_phone
 except ImportError:
-    try:
-        from worker.generators.phone_generator import generate_phone
-    except ImportError:
-        from generators.phone_generator import generate_phone
+    from worker.generators.phone_generator import generate_phone
 
 
 DEFAULT_STATIC_NAME = os.getenv("DEFAULT_STATIC_NAME", "Chaitanya Reddy")
