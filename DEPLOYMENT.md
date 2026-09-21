@@ -61,11 +61,11 @@ GOOGLE_SHEETS_WORKSHEET=Results
 GOOGLE_SERVICE_ACCOUNT_JSON=/etc/secrets/google-service-account.json
 WORKER_ID=render-worker-1
 
-# Controlled multi-device concurrency settings for 512MB RAM tier:
+# High-throughput settings for single-task sequential execution:
 CONCURRENT_WORKERS=1
-SIGNUP_CONCURRENCY=3
-MAX_PARALLEL_SIGNUPS=3
-MAX_CONCURRENT_DEVICES=3
+SIGNUP_CONCURRENCY=12
+MAX_PARALLEL_SIGNUPS=16
+MAX_CONCURRENT_DEVICES=16
 MALLOC_ARENA_MAX=2
 ```
 

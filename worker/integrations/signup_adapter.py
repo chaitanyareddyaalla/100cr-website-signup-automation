@@ -53,9 +53,9 @@ def _http_pool():
         if _HTTP_POOL is None:
             import urllib3
 
-            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "5")), 10))
+            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "16")), 25))
             _HTTP_POOL = urllib3.PoolManager(
-                num_pools=2,
+                num_pools=4,
                 maxsize=maxsize,
                 timeout=urllib3.Timeout(connect=3.0, read=8.0),
                 retries=False,

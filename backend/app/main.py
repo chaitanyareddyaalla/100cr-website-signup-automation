@@ -351,8 +351,11 @@ def with_write_retry(fn, max_attempts: int = 10):
 
 
 def get_max_device_concurrency() -> int:
-    val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or "3"
-    return max(1, min(int(val), 5))
+    use_browser = os.getenv("USE_BROWSER", "false").lower() in ("true", "1")
+    default_val = "3" if use_browser else "12"
+    val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or default_val
+    max_cap = 5 if use_browser else 25
+    return max(1, min(int(val), max_cap))
 
 
 def acquire_signup_slot() -> None:
@@ -711,8 +714,14 @@ def record_success(batch_id: str, account_id: str, test_id: str) -> dict | None:
     return batch
 
 
+_has_authorized_identities: bool | None = None
+
+
 def claim_next_available_identity(batch_id: str) -> str | None:
     """Atomically find and reserve an AVAILABLE identity for this batch."""
+    global _has_authorized_identities
+    if _has_authorized_identities is False:
+        return None
     with closing(connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -720,6 +729,7 @@ def claim_next_available_identity(batch_id: str) -> str | None:
         ).fetchone()
         if row is None:
             connection.rollback()
+            _has_authorized_identities = False
             return None
         identifier = row["identifier"]
         connection.execute(
@@ -835,6 +845,8 @@ def claim_unique_phone(batch_id: str) -> str:
 
 
 def mark_phone_status(phone: str, status: str) -> None:
+    if os.getenv("ENABLE_DATA_STORAGE", "false").lower() != "true":
+        return
     def _do() -> None:
         with closing(connect()) as connection:
             connection.execute(
@@ -844,13 +856,15 @@ def mark_phone_status(phone: str, status: str) -> None:
             connection.commit()
 
     try:
-        with_write_retry(_do)
+        with_write_retry(_do, max_attempts=2)
     except Exception as e:
         logger.warning(f"Could not update status for phone {phone}: {e}")
 
 
 def seed_authorized_identities(identifiers: list[str]) -> int:
     """Seed test identities into the database with AVAILABLE status."""
+    global _has_authorized_identities
+    _has_authorized_identities = True
     inserted = 0
     with closing(connect()) as connection:
         for ident in identifiers:
@@ -1149,7 +1163,6 @@ def process_batch(batch_id: str) -> None:
                 exc = finished.exception()
                 if exc is not None:
                     fatal.append(exc)
-            heartbeat_job(job_id)
             return pending
 
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"signup-{batch_id[:8]}") as pool:
