@@ -46,18 +46,19 @@ def test_unique_phone_no_reuse_across_calls_and_batches(tmp_path, monkeypatch):
     assert phone_new not in generated_phones
 
 
-def test_generate_phone_full_digit_space():
-    from worker.generators.phone_generator import generate_phone
+def test_generate_phone_authentic_indian_prefixes():
+    from worker.generators.phone_generator import VALID_INDIAN_PREFIXES, generate_phone
 
     seen_prefixes = set()
     for _ in range(500):
         phone = generate_phone()
         assert len(phone) == 10
         assert phone.isdigit()
-        assert phone[0] in "0123456789"
-        seen_prefixes.add(phone[0])
+        assert phone[0] in "6789"
+        seen_prefixes.add(phone[:2])
 
-    # Over 500 generations across 10B space, diverse digits (0-9) appear
     assert len(seen_prefixes) >= 5
+    for p in seen_prefixes:
+        assert p in VALID_INDIAN_PREFIXES
 
 

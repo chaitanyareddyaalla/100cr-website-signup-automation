@@ -1048,7 +1048,7 @@ def process_batch(batch_id: str) -> None:
         )
         hb_thread.start()
 
-        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "500"))
+        max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "2000"))
         concurrency = get_max_device_concurrency()
         limit_reached_event = threading.Event()
         circuit_event = threading.Event()
@@ -1128,6 +1128,10 @@ def process_batch(batch_id: str) -> None:
                             "created_at": getattr(result, "timestamp", now()),
                         })
                         return
+                    if result.status == "RATE_LIMITED":
+                        logger.warning("Batch %s: target site rate limited; cooling down 0.5s", batch_id)
+                        time.sleep(0.5)
+                        continue
                     if should_retry(result.status, BatchStatus.RUNNING.value, retry):
                         next_retry = retry + 1
                         logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
@@ -1147,8 +1151,8 @@ def process_batch(batch_id: str) -> None:
                     if current_consecutive >= max_consecutive_failures:
                         batch_error_msg = f"Circuit breaker tripped after {current_consecutive} consecutive failures on the target website."
                         circuit_event.set()
-                    elif current_consecutive > 15 and current_consecutive % 10 == 0:
-                        time.sleep(0.3)
+                    elif current_consecutive > 10 and current_consecutive % 10 == 0:
+                        time.sleep(0.2)
                     return
             finally:
                 release_signup_slot()
@@ -1255,6 +1259,26 @@ def process_batch(batch_id: str) -> None:
         trim_memory()
 
 
+def get_next_queued_batch_id() -> str | None:
+    """Fetch next batch from memory queue or persistent database queue."""
+    if not job_queue.empty():
+        try:
+            return job_queue.get_nowait()
+        except Empty:
+            pass
+    try:
+        with closing(connect()) as connection:
+            row = connection.execute(
+                "SELECT id FROM batches WHERE status = ? ORDER BY rowid ASC LIMIT 1",
+                (BatchStatus.QUEUED.value,),
+            ).fetchone()
+            if row:
+                return row["id"]
+    except Exception:
+        pass
+    return None
+
+
 def worker_loop(worker_name: str = "worker-1") -> None:
     logger.info(f"Worker loop started: {worker_name}")
     last_recovery = 0.0
@@ -1272,15 +1296,13 @@ def worker_loop(worker_name: str = "worker-1") -> None:
                     logger.info(f"[{worker_name}] Recovered {recovered} abandoned jobs")
             except Exception:
                 pass
-        if job_queue.empty():
-            time.sleep(0.02)
-            continue
         if not _task_execution_lock.acquire(timeout=0.05):
+            time.sleep(0.01)
             continue
         try:
-            try:
-                batch_id = job_queue.get_nowait()
-            except Empty:
+            batch_id = get_next_queued_batch_id()
+            if not batch_id:
+                time.sleep(0.02)
                 continue
             try:
                 job_queue.record_heartbeat(worker_name, "BUSY")
@@ -1294,6 +1316,7 @@ def worker_loop(worker_name: str = "worker-1") -> None:
                 trim_memory()
         finally:
             _task_execution_lock.release()
+            time.sleep(0.01)
 
 
 app = FastAPI(title="Signup Automation API", version="1.0.0")

@@ -126,6 +126,13 @@ class AuthorizedPlaywrightAdapter:
         except Exception:
             pass
 
+        if http_status == 429 or "too many requests" in body_lower or "rate limit" in body_lower:
+            return SignupResult(
+                account_id=identity.account_id,
+                status="RATE_LIMITED",
+                error=clean_msg or "Rate limited (HTTP 429)",
+                phone=identity.phone,
+            )
         if http_status == 409 or any(marker in body_lower for marker in _DUPLICATE_MARKERS):
             return SignupResult.duplicate(identity.account_id, phone=identity.phone)
         if any(marker in body_lower for marker in _LIMIT_MARKERS):
