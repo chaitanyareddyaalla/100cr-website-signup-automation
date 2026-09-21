@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     
     # Batch processing
     target_batch_size: int = int(os.getenv("TARGET_BATCH_SIZE", "1000"))
-    max_signup_retries: int = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
+    max_signup_retries: int = int(os.getenv("MAX_SIGNUP_RETRIES", "0"))
     retry_delay_seconds: float = float(os.getenv("RETRY_DELAY_SECONDS", "2"))
     retry_backoff_multiplier: float = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2"))
     

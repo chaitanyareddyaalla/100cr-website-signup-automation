@@ -116,7 +116,7 @@ class BatchResponse(BaseModel):
 
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
-MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "3"))
+MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "2"))
 RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
 MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "3.0"))
@@ -1109,6 +1109,30 @@ def process_batch(batch_id: str) -> None:
                         limit_reached_event.set()
                         return
                     if result.status == "DUPLICATE":
+                        if retry > 0:
+                            # A retry seeing "already registered" means attempt 1 actually succeeded on the target server!
+                            logger.info("Batch %s: phone was registered by previous attempt; recording as SUCCESS", batch_id)
+                            with fail_lock:
+                                consecutive_failures = 0
+                            mark_phone_status(identity.phone, "SUCCESS")
+                            recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
+                            if recorded_batch is not None:
+                                _record_account(identity, result, batch_id, recorded_batch["referral"])
+                                schedule_export({
+                                    "id": result.account_id,
+                                    "name": identity.name,
+                                    "test_id": identity.test_id,
+                                    "phone": identity.phone,
+                                    "password": getattr(identity, "password", ""),
+                                    "place": getattr(identity, "place", ""),
+                                    "language": getattr(identity, "language", ""),
+                                    "referral": recorded_batch["referral"],
+                                    "batch_id": batch_id,
+                                    "status": "SUCCESS",
+                                    "error": "",
+                                    "created_at": getattr(result, "timestamp", now()),
+                                })
+                            return
                         logger.info("Batch %s: phone already registered; trying another 10-digit number", batch_id)
                         mark_phone_status(identity.phone, "DUPLICATE")
                         increment_batch_counters(batch_id, skipped=1, attempted=1)
