@@ -81,6 +81,25 @@ export function getWorkers() {
   return request<WorkerInfo>('/workers')
 }
 
+export type MemoryStats = {
+  message: string
+  status: string
+  before_rss_mb: number
+  current_rss_mb: number
+  freed_mb: number
+  purged_temp_files: number
+  timestamp: string
+}
+
+export function getMemoryStats() {
+  return request<{ rss_mb: number; timestamp: string }>('/system/memory')
+}
+
+export function clearMemory() {
+  return request<MemoryStats>('/system/clear-memory', { method: 'POST' })
+}
+
 export function getExportUrl(id: string, format: 'csv' | 'json'): string {
   return `${API_URL}/batches/${id}/export/${format}`
 }
+

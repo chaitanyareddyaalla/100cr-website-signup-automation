@@ -821,3 +821,23 @@ def test_claim_job_rejects_non_queued_batch() -> None:
     backend_main.update_batch(batch["id"], status="COMPLETED")
     job_id = backend_main.claim_job(batch["id"])
     assert job_id is None
+
+
+def test_system_memory_endpoints() -> None:
+    with TestClient(app) as client:
+        # Test memory usage retrieval
+        res = client.get("/system/memory")
+        assert res.status_code == 200
+        data = res.json()
+        assert "rss_mb" in data
+        assert isinstance(data["rss_mb"], (int, float))
+
+        # Test memory clearance
+        clear_res = client.post("/system/clear-memory")
+        assert clear_res.status_code == 200
+        clear_data = clear_res.json()
+        assert clear_data["status"] == "success"
+        assert "current_rss_mb" in clear_data
+        assert "freed_mb" in clear_data
+        assert "purged_temp_files" in clear_data
+

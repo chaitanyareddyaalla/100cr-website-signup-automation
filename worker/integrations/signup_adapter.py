@@ -55,11 +55,11 @@ def _http_pool():
             import urllib3
 
             maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "35")), 50))
-            read_timeout = float(os.getenv("SIGNUP_TIMEOUT_SECONDS", "20.0"))
+            read_timeout = float(os.getenv("SIGNUP_TIMEOUT_SECONDS", "10.0"))
             _HTTP_POOL = urllib3.PoolManager(
                 num_pools=8,
                 maxsize=maxsize,
-                timeout=urllib3.Timeout(connect=4.0, read=read_timeout),
+                timeout=urllib3.Timeout(connect=3.0, read=read_timeout),
                 retries=False,
             )
         return _HTTP_POOL
@@ -89,12 +89,13 @@ class AuthorizedPlaywrightAdapter:
         import time
         import urllib3
 
+        safe_password = (identity.password or "").strip() or "SecurePass@123"
         payload = json.dumps(
             {
                 "name": identity.name or "Chaitanya Reddy",
                 "phone": identity.phone,
                 "place": identity.place or "Hyderabad",
-                "password": identity.password or "SecurePass@123",
+                "password": safe_password,
                 "referral_code": identity.referral,
             }
         ).encode("utf-8")
@@ -108,6 +109,7 @@ class AuthorizedPlaywrightAdapter:
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Connection": "keep-alive",
                 },
             )
             # Cloudflare 525 SSL handshake is often an ephemeral glitch; perform a fast single retry

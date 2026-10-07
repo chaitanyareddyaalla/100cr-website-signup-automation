@@ -187,3 +187,46 @@ View logs in Render dashboard under "Logs" tab. Look for:
 - Verify service account email has edit access to the spreadsheet
 - Check `GOOGLE_SHEETS_ID` and `GOOGLE_SHEETS_WORKSHEET` are correct
 - View logs for sheet write errors
+
+### Render Memory is Full (Out Of Memory / 512MB Exceeded)
+
+Render Free/Starter tier has a strict **512 MB RAM limit**. When memory fills up or hits 100%:
+
+#### 1. Instant Clear via Render Dashboard
+1. Go to [dashboard.render.com](https://dashboard.render.com).
+2. Click your Web Service.
+3. In the top right, click **"Manual Deploy"** → **"Clear build cache & deploy"**, OR click the service settings/three dots and select **"Restart"**.
+4. This immediately terminates memory-bloated processes, purges build cache, and reboots the container fresh at ~40MB RAM.
+
+#### 2. Instant Clear via API / CLI (No Restart Needed)
+Trigger runtime garbage collection, glibc heap arena reclamation, and `/tmp` purge:
+```bash
+curl -X POST https://YOUR-RENDER-BACKEND.onrender.com/system/clear-memory
+```
+Response:
+```json
+{
+  "message": "System memory cleared successfully",
+  "status": "success",
+  "before_rss_mb": 412.5,
+  "current_rss_mb": 48.2,
+  "freed_mb": 364.3,
+  "purged_temp_files": 4,
+  "timestamp": "2026-10-05T09:25:00+00:00"
+}
+```
+
+#### 3. Instant Clear via Frontend UI
+Navigate to **System & Workers** tab in the frontend dashboard and click **"🧹 Clear Render Memory Now"**.
+
+#### 4. Permanent Prevention (Low-Memory Render Environment Variables)
+In the Render Web Service **Environment** settings:
+```
+MALLOC_ARENA_MAX=2
+CONCURRENT_WORKERS=1
+SIGNUP_CONCURRENCY=5
+MAX_PARALLEL_SIGNUPS=5
+USE_BROWSER=false
+```
+> **Note**: Direct API automation (`USE_BROWSER=false`) only uses ~40 MB RAM, whereas Playwright headless Chromium instances use 150-250 MB each and will quickly overflow Render's 512 MB memory limit if run concurrently.
+

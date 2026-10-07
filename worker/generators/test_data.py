@@ -7,7 +7,7 @@ except ImportError:
     from worker.generators.phone_generator import generate_phone
 
 
-DEFAULT_STATIC_NAME = os.getenv("DEFAULT_STATIC_NAME", "Chaitanya Reddy")
+DEFAULT_STATIC_NAME = os.getenv("DEFAULT_STATIC_NAME", "Sree Reddy")
 DEFAULT_STATIC_PASSWORD = os.getenv("DEFAULT_STATIC_PASSWORD", "SecurePass@123")
 DEFAULT_STATIC_PLACE = os.getenv("DEFAULT_STATIC_PLACE", "Hyderabad")
 DEFAULT_STATIC_LANGUAGE = os.getenv("DEFAULT_STATIC_LANGUAGE", "en")

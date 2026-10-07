@@ -101,6 +101,26 @@ pkill -f "python.*uvicorn"
 rm data/signup_automation.db
 ```
 
+### Render Memory is Full / Out Of Memory (512MB RAM Limit)
+
+**Symptoms**: Render dashboard warning "Memory usage: 100%" or service crashes with `OOMKilled`.
+
+**Quick Fixes**:
+1. **Clear memory immediately without rebooting**:
+   ```bash
+   curl -X POST https://YOUR-RENDER-BACKEND.onrender.com/system/clear-memory
+   ```
+2. **Clear via Dashboard**: Go to Render Dashboard -> Select service -> Click **"Manual Deploy"** -> **"Clear build cache & deploy"** or **"Restart Service"**.
+3. **Configure low-memory variables in Render Dashboard**:
+   ```
+   MALLOC_ARENA_MAX=2
+   CONCURRENT_WORKERS=1
+   SIGNUP_CONCURRENCY=5
+   MAX_PARALLEL_SIGNUPS=5
+   USE_BROWSER=false
+   ```
+
+
 **Error**: `connection refused` on PostgreSQL
 
 ```bash

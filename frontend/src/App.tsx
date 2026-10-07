@@ -5,6 +5,8 @@ import {
   getHealth,
   getReadiness,
   getWorkers,
+  getMemoryStats,
+  clearMemory,
   updateBatch,
   listBatches,
   API_URL,
@@ -31,19 +33,24 @@ function App() {
   const [readiness, setReadiness] = useState<Readiness | null>(null)
   const [workerInfo, setWorkerInfo] = useState<WorkerInfo | null>(null)
   const [healthStatus, setHealthStatus] = useState<string>('checking...')
+  const [memoryRss, setMemoryRss] = useState<number | null>(null)
+  const [clearingMemory, setClearingMemory] = useState(false)
+  const [memoryMsg, setMemoryMsg] = useState('')
 
   // Fetch admin stats & batches list periodically
   useEffect(() => {
     async function fetchAdminData() {
       try {
-        const [r, w, h] = await Promise.all([
+        const [r, w, h, m] = await Promise.all([
           getReadiness().catch(() => null),
           getWorkers().catch(() => null),
           getHealth().catch(() => ({ status: 'error', database: 'error' })),
+          getMemoryStats().catch(() => null),
         ])
         if (r) setReadiness(r)
         if (w) setWorkerInfo(w)
         if (h) setHealthStatus(h.status)
+        if (m) setMemoryRss(m.rss_mb)
       } catch {
         setHealthStatus('error')
       }
@@ -196,6 +203,20 @@ function App() {
       setError(`Action '${action}' failed or is not available.`)
     } finally {
       setOperation(null)
+    }
+  }
+
+  async function handleClearMemory() {
+    setClearingMemory(true)
+    setMemoryMsg('')
+    try {
+      const res = await clearMemory()
+      setMemoryRss(res.current_rss_mb)
+      setMemoryMsg(`Memory cleared! RSS: ${res.current_rss_mb} MB (Purged ${res.purged_temp_files} temp files)`)
+    } catch {
+      setMemoryMsg('Failed to clear memory.')
+    } finally {
+      setClearingMemory(false)
     }
   }
 
@@ -813,6 +834,45 @@ function App() {
                 <p>No recent worker jobs recorded.</p>
               </div>
             )}
+          </div>
+
+          {/* Memory & Resource Management */}
+          <div className="admin-card">
+            <p className="card-label">RENDER CONTAINER MEMORY & CACHE</p>
+            <table className="admin-table">
+              <tbody>
+                <tr>
+                  <td>Container Memory (RSS)</td>
+                  <td style={{ fontWeight: 700, color: (memoryRss || 0) > 350 ? '#ef4444' : '#10b981' }}>
+                    {memoryRss !== null ? `${memoryRss} MB` : 'Checking...'}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Render Free Limit</td>
+                  <td style={{ color: 'var(--text-dim)' }}>512 MB Max</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div style={{ marginTop: '16px' }}>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={handleClearMemory}
+                disabled={clearingMemory}
+                style={{ width: '100%', padding: '10px 16px', fontWeight: 600 }}
+              >
+                {clearingMemory ? 'Purging Memory & Caches...' : '🧹 Clear Render Memory Now'}
+              </button>
+              {memoryMsg && (
+                <div style={{ marginTop: '10px', fontSize: '0.8125rem', color: memoryMsg.includes('Failed') ? '#ef4444' : '#10b981' }}>
+                  {memoryMsg}
+                </div>
+              )}
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '8px', lineHeight: 1.4 }}>
+                Runs glibc <code>malloc_trim</code>, full cyclic Python garbage collection, flushes SQLite WAL memory maps, and purges orphaned temporary browser profiles.
+              </p>
+            </div>
           </div>
         </div>
       )}

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
+from dotenv import load_dotenv
+
+if "pytest" not in sys.modules and os.getenv("APP_ENV") != "test":
+    load_dotenv()
 
 # Limit glibc memory arena allocations in Linux/Docker containers early
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
@@ -13,7 +18,9 @@ import io
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -309,18 +316,92 @@ global_used_phones: set[str] = set()
 _phone_lock = threading.Lock()
 
 
-def trim_memory() -> None:
-    """Trigger Python garbage collection and advise glibc to release unused heap pages to the OS."""
+def get_memory_usage_mb() -> float:
+    """Read resident set size (RSS) memory in megabytes."""
     try:
-        gc.collect()
-        if hasattr(os, "uname") and os.uname().sysname == "Linux":
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+        proc_status = Path("/proc/self/status")
+        if proc_status.exists():
+            for line in proc_status.read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return round(float(parts[1]) / 1024.0, 2)
     except Exception:
         pass
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def purge_temp_browser_data() -> int:
+    """Purge stale browser/playwright/device directories in /tmp to free container memory and disk."""
+    purged = 0
+    try:
+        tmp_dir = tempfile.gettempdir()
+        if os.path.exists(tmp_dir):
+            for entry in os.listdir(tmp_dir):
+                if entry.startswith(("render_device_", "playwright_", "tmp-", ".org.chromium.")):
+                    full_p = os.path.join(tmp_dir, entry)
+                    try:
+                        if os.path.isdir(full_p):
+                            shutil.rmtree(full_p, ignore_errors=True)
+                            purged += 1
+                        elif os.path.isfile(full_p):
+                            os.remove(full_p)
+                            purged += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return purged
+
+
+def trim_memory() -> dict[str, object]:
+    """Trigger Python garbage collection, clear temp dirs, and advise glibc to release unused heap pages to OS."""
+    before_mb = get_memory_usage_mb()
+    purged_temp = purge_temp_browser_data()
+
+    # 1. Clear dead subscriber queues
+    with state_lock:
+        stale_batch_ids = [bid for bid, qs in subscribers.items() if not qs]
+        for bid in stale_batch_ids:
+            subscribers.pop(bid, None)
+
+    # 2. Prune old rate limit entries
+    cutoff = time.monotonic() - 60
+    with rate_limit_lock:
+        stale_ips = [ip for ip, stamps in request_windows.items() if not stamps or stamps[-1] < cutoff]
+        for ip in stale_ips:
+            request_windows.pop(ip, None)
+
+    # 3. Full generational cyclic garbage collection
+    try:
+        gc.collect(2)
+    except Exception:
+        pass
+
+    # 4. malloc_trim on Linux (instruct glibc to return freed heap arenas directly to OS kernel)
+    if hasattr(os, "uname") and os.uname().sysname == "Linux":
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+    # 5. Checkpoint SQLite WAL so wal/shm memory mappings shrink
+    checkpoint_wal()
+
+    after_mb = get_memory_usage_mb()
+    return {
+        "status": "success",
+        "before_rss_mb": before_mb,
+        "current_rss_mb": after_mb,
+        "freed_mb": max(0.0, round(before_mb - after_mb, 2)) if before_mb > 0 else 0.0,
+        "purged_temp_files": purged_temp,
+        "timestamp": now(),
+    }
 
 
 def checkpoint_wal() -> None:
@@ -1153,12 +1234,12 @@ def process_batch(batch_id: str) -> None:
                         })
                         return
                     if result.status == "RATE_LIMITED":
-                        logger.warning("Batch %s: target site rate limited; cooling down 0.5s", batch_id)
-                        time.sleep(0.5)
+                        logger.warning("Batch %s: target site rate limited; cooling down 0.15s", batch_id)
+                        time.sleep(0.15)
                         continue
                     if result.status == "SERVER_ERROR":
-                        logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.5s", batch_id)
-                        time.sleep(0.5)
+                        logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.15s", batch_id)
+                        time.sleep(0.15)
                     if should_retry(result.status, BatchStatus.RUNNING.value, retry):
                         next_retry = retry + 1
                         logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
@@ -1379,7 +1460,7 @@ async def security_headers(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
     """Bound local rate limiting; Redis should replace this for multi-instance use."""
-    if request.url.path in {"/health", "/healthz", "/ready"}:
+    if request.url.path in {"/health", "/healthz", "/ready", "/system/memory", "/system/clear-memory"}:
         return await call_next(request)
     limit = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "600"))
     client = request.client.host if request.client else "unknown"
@@ -1470,6 +1551,27 @@ def readiness() -> dict[str, object]:
         "redis": "connected" if redis_ok else "offline_or_local_fallback",
         "worker": "running" if has_workers else "starting",
         "active_workers": len(active_workers),
+    }
+
+
+@app.get("/system/memory")
+def get_system_memory() -> dict[str, object]:
+    """Report current container process resident set size (RSS) memory in MB."""
+    return {
+        "rss_mb": get_memory_usage_mb(),
+        "timestamp": now(),
+    }
+
+
+@app.post("/system/clear-memory")
+def clear_system_memory() -> dict[str, object]:
+    """Force cyclic GC, malloc_trim on Linux, purge /tmp browser data, and shrink caches."""
+    logger.info("Manual memory clearance requested via /system/clear-memory")
+    stats = trim_memory()
+    logger.info(f"Memory clearance completed: {stats}")
+    return {
+        "message": "System memory cleared successfully",
+        **stats,
     }
 
 
