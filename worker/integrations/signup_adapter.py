@@ -54,14 +54,26 @@ def _http_pool():
         if _HTTP_POOL is None:
             import urllib3
 
-            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "35")), 50))
+            maxsize = max(1, min(int(os.getenv("MAX_PARALLEL_SIGNUPS", "15")), 50))
             read_timeout = float(os.getenv("SIGNUP_TIMEOUT_SECONDS", "10.0"))
-            _HTTP_POOL = urllib3.PoolManager(
-                num_pools=8,
-                maxsize=maxsize,
-                timeout=urllib3.Timeout(connect=3.0, read=read_timeout),
-                retries=False,
-            )
+            timeout = urllib3.Timeout(connect=3.0, read=read_timeout)
+            proxy_url = os.getenv("ROTATING_PROXY_URL") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+            if proxy_url:
+                logger.info("Using configured proxy pool for signup adapter: %s", proxy_url.split("@")[-1])
+                _HTTP_POOL = urllib3.ProxyManager(
+                    proxy_url,
+                    num_pools=8,
+                    maxsize=maxsize,
+                    timeout=timeout,
+                    retries=False,
+                )
+            else:
+                _HTTP_POOL = urllib3.PoolManager(
+                    num_pools=8,
+                    maxsize=maxsize,
+                    timeout=timeout,
+                    retries=False,
+                )
         return _HTTP_POOL
 
 

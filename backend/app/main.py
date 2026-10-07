@@ -123,10 +123,11 @@ class BatchResponse(BaseModel):
 
 DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "signup_automation.db"
 TARGET_SIZE = 1000
-MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "2"))
-RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.5"))
+MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "0"))
+RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.2"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
 MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "3.0"))
+DISPATCH_PACING_SECONDS = float(os.getenv("DISPATCH_PACING_SECONDS", "0.04"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
@@ -433,7 +434,7 @@ def with_write_retry(fn, max_attempts: int = 10):
 
 def get_max_device_concurrency() -> int:
     use_browser = os.getenv("USE_BROWSER", "false").lower() in ("true", "1")
-    default_val = "5" if use_browser else "30"
+    default_val = "5" if use_browser else "12"
     val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or default_val
     max_cap = 10 if use_browser else 50
     return max(1, min(int(val), max_cap))
@@ -1254,8 +1255,8 @@ def process_batch(batch_id: str) -> None:
                     increment_batch_counters(batch_id, failed=1, attempted=1)
                     finalize_identity(identity.test_id, "FAILED", batch_id)
                     with fail_lock:
-                        # Transient 5xx server errors do not count towards client-side circuit breaker
-                        if result.status != "SERVER_ERROR":
+                        # Transient 5xx server errors and rate limits do not count towards client-side circuit breaker
+                        if result.status not in ("SERVER_ERROR", "RATE_LIMITED"):
                             consecutive_failures += 1
                         current_consecutive = consecutive_failures
                     if current_consecutive >= max_consecutive_failures:
@@ -1310,6 +1311,8 @@ def process_batch(batch_id: str) -> None:
                     ):
                         identity = _build_identity(batch_id, batch.get("referral", ""))
                         pending.add(pool.submit(run_one, identity))
+                        if DISPATCH_PACING_SECONDS > 0:
+                            time.sleep(DISPATCH_PACING_SECONDS)
             finally:
                 if pending:
                     wait_time = 0.5 if (stop_event.is_set() or batch.get("status") == BatchStatus.STOPPING.value) else 5.0
@@ -1335,12 +1338,13 @@ def process_batch(batch_id: str) -> None:
             acknowledge_job(job_id)
             return
         if limit_reached_event.is_set() or circuit_event.is_set():
-            final_status = BatchStatus.FAILED.value
-            err_msg = batch_error_msg or (
-                f"Referral code reached its maximum limit on target site (halted at {batch['successful']}/{batch['target']} signups)"
-                if limit_reached_event.is_set()
-                else f"Halted after {max_consecutive_failures} consecutive failures on target site"
-            )
+            if limit_reached_event.is_set():
+                # Referral code achieved maximum allowed count on target site; mark completed if signups > 0
+                final_status = BatchStatus.COMPLETED.value if batch["successful"] > 0 else BatchStatus.FAILED.value
+                err_msg = batch_error_msg or f"Referral code maximum limit reached on target site ({batch['successful']}/{batch['target']} signups completed)"
+            else:
+                final_status = BatchStatus.FAILED.value
+                err_msg = f"Halted after {max_consecutive_failures} consecutive failures on target site"
             update_batch(batch_id, status=final_status, completed_at=now(), error_message=err_msg)
             acknowledge_job(job_id, final_status)
             return

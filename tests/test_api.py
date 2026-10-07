@@ -277,6 +277,7 @@ def test_worker_retries_transient_failure(monkeypatch) -> None:
         status = next(results)
         return type("Result", (), {"status": status, "account_id": identity.account_id})()
 
+    monkeypatch.setattr(backend_main, "MAX_SIGNUP_RETRIES", 2)
     monkeypatch.setattr(backend_main, "run_mock_signup", signup)
     batch = queued_batch(1)
     backend_main.process_batch(batch["id"])
@@ -546,6 +547,7 @@ def test_retry_policy_uses_backoff_and_blocks_duplicates(monkeypatch) -> None:
     monkeypatch.setattr(backend_main, "RETRY_DELAY_SECONDS", 0.5)
     monkeypatch.setattr(backend_main, "RETRY_BACKOFF_MULTIPLIER", 2.0)
     monkeypatch.setattr(backend_main, "MAX_RETRY_DELAY_SECONDS", 2.0)
+    monkeypatch.setattr(backend_main, "MAX_SIGNUP_RETRIES", 2)
     assert backend_main.calculate_retry_delay(1) == 0.5
     assert backend_main.calculate_retry_delay(2) == 1.0
     assert backend_main.calculate_retry_delay(3) == 2.0
@@ -555,6 +557,9 @@ def test_retry_policy_uses_backoff_and_blocks_duplicates(monkeypatch) -> None:
     assert backend_main.should_retry("DUPLICATE", "RUNNING", 1) is False
     assert backend_main.should_retry("LIMIT_REACHED", "RUNNING", 1) is False
     assert backend_main.should_retry("FAILURE", "CANCELLED", 1) is False
+    # Verify zero-retry policy disables retries
+    monkeypatch.setattr(backend_main, "MAX_SIGNUP_RETRIES", 0)
+    assert backend_main.should_retry("FAILURE", "RUNNING", 0) is False
 
 
 def test_data_storage_is_safely_disabled(tmp_path) -> None:
