@@ -101,8 +101,11 @@ class AuthorizedPlaywrightAdapter:
         clean_msg = body
         try:
             parsed = json.loads(body)
-            if isinstance(parsed, dict) and "message" in parsed:
-                clean_msg = str(parsed["message"])
+            if isinstance(parsed, dict):
+                if "message" in parsed:
+                    clean_msg = str(parsed["message"])
+                elif "error" in parsed:
+                    clean_msg = str(parsed["error"])
         except Exception:
             pass
         return clean_msg
@@ -224,7 +227,7 @@ class AuthorizedPlaywrightAdapter:
                 error=clean_msg or f"Server error {http_status}",
                 phone=identity.phone,
             )
-        if http_status == 429 or "too many requests" in body_lower or "rate limit" in body_lower:
+        if http_status == 429 or "too many signups" in body_lower or "too many requests" in body_lower or "rate limit" in body_lower:
             return SignupResult(
                 account_id=identity.account_id,
                 status="RATE_LIMITED",

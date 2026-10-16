@@ -1149,11 +1149,12 @@ def process_batch(batch_id: str) -> None:
         circuit_event = threading.Event()
         fail_lock = threading.Lock()
         consecutive_failures = 0
+        rate_limit_until = 0.0
         fatal: list[BaseException] = []
         batch_error_msg = ""
 
         def run_one(identity: TestIdentity) -> None:
-            nonlocal consecutive_failures, batch_error_msg
+            nonlocal consecutive_failures, batch_error_msg, rate_limit_until
             acquire_signup_slot()
             try:
                 if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
@@ -1248,12 +1249,14 @@ def process_batch(batch_id: str) -> None:
                         })
                         return
                     if result.status == "RATE_LIMITED":
-                        logger.warning("Batch %s: target site rate limited; cooling down 0.15s", batch_id)
-                        time.sleep(0.15)
+                        logger.warning("Batch %s: target site rate limited; cooling down 1.5s", batch_id)
+                        rate_limit_until = time.monotonic() + 1.5
+                        if stop_event.wait(1.5):
+                            return
                         continue
                     if result.status == "SERVER_ERROR":
-                        logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.15s", batch_id)
-                        time.sleep(0.15)
+                        logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.25s", batch_id)
+                        time.sleep(0.25)
                     if should_retry(result.status, BatchStatus.RUNNING.value, retry):
                         next_retry = retry + 1
                         logger.warning("Batch %s: retry %s (status=%s)", batch_id, next_retry, result.status)
@@ -1263,6 +1266,9 @@ def process_batch(batch_id: str) -> None:
                         if delay > 0 and stop_event.wait(delay):
                             return
                         continue
+                    if result.status == "RATE_LIMITED":
+                        # Loop ended on rate limit; do not record as failure or trip circuit
+                        return
                     # On failure or timeout after retry: record and move to next 10-digit number
                     mark_phone_status(identity.phone, "FAILED")
                     increment_batch_counters(batch_id, failed=1, attempted=1)
@@ -1327,6 +1333,9 @@ def process_batch(batch_id: str) -> None:
                         continue
                     if batch["status"] != BatchStatus.RUNNING.value:
                         break
+                    if time.monotonic() < rate_limit_until:
+                        time.sleep(0.1)
+                        continue
                     while (
                         len(pending) < concurrency
                         and (batch["successful"] + len(pending)) < batch["target"]
