@@ -97,60 +97,7 @@ class AuthorizedPlaywrightAdapter:
             return self._browser_signup(identity)
         return self._api_signup(identity)
 
-    def _api_signup(self, identity: TestIdentity) -> SignupResult:
-        import time
-        import urllib3
-
-        safe_password = (identity.password or "").strip() or "SecurePass@123"
-        payload = json.dumps(
-            {
-                "name": identity.name or "Chaitanya Reddy",
-                "phone": identity.phone,
-                "place": identity.place or "Hyderabad",
-                "password": safe_password,
-                "referral_code": identity.referral,
-            }
-        ).encode("utf-8")
-
-        endpoint = self.base_url if "api" in self.base_url else f"{self.base_url}/api/auth/signup"
-        try:
-            resp = _http_pool().request(
-                "POST",
-                endpoint,
-                body=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Connection": "keep-alive",
-                },
-            )
-            # Cloudflare 525 SSL handshake is often an ephemeral glitch; perform a fast single retry
-            if resp.status == 525:
-                time.sleep(0.25)
-                try:
-                    resp = _http_pool().request(
-                        "POST",
-                        endpoint,
-                        body=payload,
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        },
-                    )
-                except Exception:
-                    pass
-
-            if 200 <= resp.status < 300:
-                return SignupResult.success(identity.account_id, phone=identity.phone)
-            body = (resp.data or b"").decode("utf-8", errors="replace")
-            return self._classify_error_body(identity, body, http_status=resp.status)
-        except (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.TimeoutError):
-            return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
-        except Exception as exc:
-            return SignupResult.failure(identity.account_id, error=str(exc), phone=identity.phone)
-
-    def _classify_error_body(self, identity: TestIdentity, body: str, http_status: int = 0) -> SignupResult:
-        body_lower = (body or "").lower()
+    def _extract_clean_msg(self, body: str) -> str:
         clean_msg = body
         try:
             parsed = json.loads(body)
@@ -158,6 +105,116 @@ class AuthorizedPlaywrightAdapter:
                 clean_msg = str(parsed["message"])
         except Exception:
             pass
+        return clean_msg
+
+    def _api_signup(self, identity: TestIdentity) -> SignupResult:
+        import time
+        import urllib3
+
+        safe_password = (identity.password or "").strip() or "SecurePass@123"
+        safe_name = (identity.name or "").strip() or os.getenv("DEFAULT_STATIC_NAME", "Sreedhar Reddy")
+        safe_place = (identity.place or "").strip() or os.getenv("DEFAULT_STATIC_PLACE", "Hyderabad")
+        payload = json.dumps(
+            {
+                "name": safe_name,
+                "phone": identity.phone,
+                "place": safe_place,
+                "password": safe_password,
+                "referral_code": identity.referral,
+            }
+        ).encode("utf-8")
+
+        endpoint = self.base_url if "api" in self.base_url else f"{self.base_url}/api/auth/signup"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.100crorescompany.com",
+            "Referer": "https://www.100crorescompany.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+            "Connection": "keep-alive",
+        }
+
+        max_attempts = 3
+        last_body = ""
+        last_status = 0
+        pool = _http_pool()
+
+        for attempt in range(max_attempts):
+            try:
+                resp = pool.request(
+                    "POST",
+                    endpoint,
+                    body=payload,
+                    headers=headers,
+                )
+                last_status = resp.status
+                last_body = (resp.data or b"").decode("utf-8", errors="replace")
+
+                # Successful registration
+                if 200 <= resp.status < 300:
+                    return SignupResult.success(identity.account_id, phone=identity.phone)
+
+                body_lower = last_body.lower()
+
+                # If attempt > 0 and server says duplicate/already registered,
+                # attempt 0 actually succeeded on the target server!
+                if resp.status == 409 or any(marker in body_lower for marker in _DUPLICATE_MARKERS):
+                    if attempt > 0:
+                        logger.info("Signup verified for %s: confirmed registered on attempt %d", identity.phone, attempt + 1)
+                        return SignupResult.success(identity.account_id, phone=identity.phone)
+                    return SignupResult.duplicate(identity.account_id, phone=identity.phone)
+
+                if any(marker in body_lower for marker in _LIMIT_MARKERS):
+                    return SignupResult.limit_reached(
+                        identity.account_id,
+                        error=self._extract_clean_msg(last_body) or "Referral code maximum limit reached",
+                        phone=identity.phone,
+                    )
+
+                if any(marker in body_lower for marker in _INVALID_REFERRAL_MARKERS):
+                    return SignupResult(
+                        account_id=identity.account_id,
+                        status="INVALID_REFERRAL",
+                        error=self._extract_clean_msg(last_body) or "Invalid referral code",
+                        phone=identity.phone,
+                    )
+
+                # Transient errors: 429 rate limit or 5xx / 525 Cloudflare SSL handshake
+                is_transient = (
+                    resp.status == 429
+                    or 500 <= resp.status < 600
+                    or "error code: 525" in body_lower
+                    or "ssl handshake failed" in body_lower
+                    or "rate limit" in body_lower
+                    or "too many requests" in body_lower
+                )
+                if is_transient and attempt < max_attempts - 1:
+                    sleep_time = 0.25 * (attempt + 1)
+                    time.sleep(sleep_time)
+                    continue
+
+                return self._classify_error_body(identity, last_body, http_status=resp.status)
+
+            except (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.TimeoutError):
+                if attempt < max_attempts - 1:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                return SignupResult(account_id=identity.account_id, status="TIMEOUT", error="TIMEOUT", phone=identity.phone)
+            except Exception as exc:
+                if attempt < max_attempts - 1:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                return SignupResult.failure(identity.account_id, error=str(exc), phone=identity.phone)
+
+        return self._classify_error_body(identity, last_body, http_status=last_status)
+
+    def _classify_error_body(self, identity: TestIdentity, body: str, http_status: int = 0) -> SignupResult:
+        body_lower = (body or "").lower()
+        clean_msg = self._extract_clean_msg(body)
 
         # 5xx / Cloudflare errors must be classified as SERVER_ERROR first, never as DUPLICATE or SKIPPED
         if 500 <= http_status < 600 or "error code: 525" in body_lower or "ssl handshake failed" in body_lower:
@@ -193,14 +250,17 @@ class AuthorizedPlaywrightAdapter:
 
     def _browser_signup(self, identity: TestIdentity) -> SignupResult:
         signup_url = os.getenv("SIGNUP_PAGE_URL", "https://www.100crorescompany.com/signup")
+        safe_name = (identity.name or "").strip() or os.getenv("DEFAULT_STATIC_NAME", "Sreedhar Reddy")
+        safe_place = (identity.place or "").strip() or os.getenv("DEFAULT_STATIC_PLACE", "Hyderabad")
+        safe_password = (identity.password or "").strip() or "SecurePass@123"
         try:
             with IsolatedDeviceTask(timeout_ms=self.timeout_ms) as device:
                 page = device.page
                 page.goto(signup_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                page.fill("#name", identity.name or "Chaitanya Reddy")
+                page.fill("#name", safe_name)
                 page.fill("#phone", identity.phone)
-                page.fill("#place", identity.place or "Hyderabad")
-                page.fill("#password", identity.password or "SecurePass@123")
+                page.fill("#place", safe_place)
+                page.fill("#password", safe_password)
                 page.fill("#referralCode", identity.referral)
                 page.click("button[type='submit']")
                 page.wait_for_timeout(2000)

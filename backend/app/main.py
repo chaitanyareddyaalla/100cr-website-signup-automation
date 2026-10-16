@@ -7,8 +7,21 @@ from dotenv import load_dotenv
 if "pytest" not in sys.modules and os.getenv("APP_ENV") != "test":
     load_dotenv()
 
-# Limit glibc memory arena allocations in Linux/Docker containers early
+# Limit glibc memory arena allocations and thread stack size in Linux/Docker/Render containers early
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+import threading
+
+try:
+    threading.stack_size(512 * 1024)
+except Exception:
+    pass
+
+if hasattr(os, "uname") and os.uname().sysname == "Linux":
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").mallopt(-8, 2)
+    except Exception:
+        pass
 
 import asyncio
 from collections import deque
@@ -21,7 +34,6 @@ import os
 import shutil
 import sqlite3
 import tempfile
-import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
@@ -127,7 +139,7 @@ MAX_SIGNUP_RETRIES = int(os.getenv("MAX_SIGNUP_RETRIES", "0"))
 RETRY_DELAY_SECONDS = float(os.getenv("RETRY_DELAY_SECONDS", "0.2"))
 RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
 MAX_RETRY_DELAY_SECONDS = float(os.getenv("MAX_RETRY_DELAY_SECONDS", "3.0"))
-DISPATCH_PACING_SECONDS = float(os.getenv("DISPATCH_PACING_SECONDS", "0.04"))
+DISPATCH_PACING_SECONDS = float(os.getenv("DISPATCH_PACING_SECONDS", "0.08"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4().hex[:8]}")
 WORKER_LEASE_SECONDS = float(os.getenv("WORKER_LEASE_SECONDS", "120"))
 _live_adapter: AuthorizedPlaywrightAdapter | None = None
@@ -406,10 +418,10 @@ def trim_memory() -> dict[str, object]:
 
 
 def checkpoint_wal() -> None:
-    """Passively checkpoint WAL file so -wal and memory-mapped pages remain small."""
+    """Checkpoint and truncate WAL file so -wal and memory-mapped pages remain small."""
     try:
         with closing(connect()) as connection:
-            connection.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     except Exception:
         pass
 
@@ -434,9 +446,9 @@ def with_write_retry(fn, max_attempts: int = 10):
 
 def get_max_device_concurrency() -> int:
     use_browser = os.getenv("USE_BROWSER", "false").lower() in ("true", "1")
-    default_val = "5" if use_browser else "12"
+    default_val = "2" if use_browser else "8"
     val = os.getenv("MAX_CONCURRENT_DEVICES") or os.getenv("MAX_PARALLEL_SIGNUPS") or os.getenv("SIGNUP_CONCURRENCY") or default_val
-    max_cap = 10 if use_browser else 50
+    max_cap = 4 if use_browser else 15
     return max(1, min(int(val), max_cap))
 
 
@@ -472,6 +484,7 @@ def connect() -> sqlite3.Connection:
         connection.execute("PRAGMA cache_size = -1000;")
         connection.execute("PRAGMA mmap_size = 0;")
         connection.execute("PRAGMA temp_store = FILE;")
+        connection.execute("PRAGMA wal_autocheckpoint = 100;")
     except Exception:
         pass
     return connection
@@ -1280,6 +1293,8 @@ def process_batch(batch_id: str) -> None:
 
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"signup-{batch_id[:8]}") as pool:
             pending: set = set()
+            last_trim_time = time.monotonic()
+            last_trim_count = 0
             try:
                 while True:
                     pending = drain(pending)
@@ -1292,6 +1307,17 @@ def process_batch(batch_id: str) -> None:
                         break
                     if stop_event.is_set() or batch["status"] in (BatchStatus.STOPPING.value, BatchStatus.CANCELLED.value):
                         break
+
+                    now_mono = time.monotonic()
+                    if (
+                        now_mono - last_trim_time > 15.0
+                        or (batch["successful"] - last_trim_count) >= 25
+                        or get_memory_usage_mb() > 220.0
+                    ):
+                        last_trim_time = now_mono
+                        last_trim_count = batch["successful"]
+                        trim_memory()
+
                     if batch["status"] == BatchStatus.PAUSED.value or pause_event.is_set():
                         while (batch["status"] == BatchStatus.PAUSED.value or pause_event.is_set()) and not stop_event.is_set():
                             if stop_event.wait(0.02):
