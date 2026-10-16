@@ -54,6 +54,8 @@ from worker.generators.test_data import (
     DEFAULT_STATIC_PASSWORD,
     DEFAULT_STATIC_PLACE,
     DEFAULT_STATIC_LANGUAGE,
+    generate_random_name,
+    generate_random_place,
 )
 from worker.generators.phone_generator import generate_phone
 from backend.app.api.auth import Role, require_role
@@ -778,6 +780,26 @@ def recover_abandoned_jobs() -> int:
                     )
                     job_queue.put(row["batch_id"])
                     recovered += 1
+
+            # Cleanly resolve any abandoned STOPPING batches to CANCELLED after cutoff
+            stopping_rows = connection.execute(
+                "SELECT id, updated_at FROM batches WHERE status = 'STOPPING'"
+            ).fetchall()
+            for s_row in stopping_rows:
+                bid = s_row["id"]
+                upd = s_row["updated_at"]
+                if not upd or datetime.fromisoformat(upd).timestamp() < cutoff:
+                    connection.execute(
+                        "UPDATE batches SET status = 'CANCELLED', updated_at = ? WHERE id = ?",
+                        (now(), bid),
+                    )
+                    connection.execute(
+                        "UPDATE jobs SET status = 'CANCELLED', acknowledged_at = ? WHERE batch_id = ? AND status != 'CANCELLED'",
+                        (now(), bid),
+                    )
+                    publish(bid, get_batch(bid))
+                    recovered += 1
+
             connection.commit()
     except sqlite3.OperationalError:
         initialize_database()
@@ -1059,9 +1081,9 @@ def _build_identity(batch_id: str, referral: str) -> TestIdentity:
         account_id=phone,
         test_id=phone,
         phone=phone,
-        name=DEFAULT_STATIC_NAME,
+        name=generate_random_name(),
         password=DEFAULT_STATIC_PASSWORD,
-        place=DEFAULT_STATIC_PLACE,
+        place=generate_random_place(),
         language=DEFAULT_STATIC_LANGUAGE,
         referral=referral,
     )
@@ -1149,12 +1171,13 @@ def process_batch(batch_id: str) -> None:
         circuit_event = threading.Event()
         fail_lock = threading.Lock()
         consecutive_failures = 0
+        consecutive_rate_limits = 0
         rate_limit_until = 0.0
         fatal: list[BaseException] = []
         batch_error_msg = ""
 
         def run_one(identity: TestIdentity) -> None:
-            nonlocal consecutive_failures, batch_error_msg, rate_limit_until
+            nonlocal consecutive_failures, consecutive_rate_limits, batch_error_msg, rate_limit_until
             acquire_signup_slot()
             try:
                 if stop_event.is_set() or limit_reached_event.is_set() or pause_event.is_set():
@@ -1172,6 +1195,7 @@ def process_batch(batch_id: str) -> None:
                     if result.status == "SUCCESS":
                         with fail_lock:
                             consecutive_failures = 0
+                            consecutive_rate_limits = 0
                         logger.info("Batch %s: signup succeeded", batch_id)
                         mark_phone_status(identity.phone, "SUCCESS")
                         recorded_batch = record_success(batch_id, result.account_id, identity.test_id)
@@ -1251,6 +1275,16 @@ def process_batch(batch_id: str) -> None:
                     if result.status == "RATE_LIMITED":
                         logger.warning("Batch %s: target site rate limited; cooling down 1.5s", batch_id)
                         rate_limit_until = time.monotonic() + 1.5
+                        with fail_lock:
+                            consecutive_rate_limits += 1
+                            curr_rl = consecutive_rate_limits
+                        if curr_rl >= 3:
+                            batch_error_msg = getattr(result, "error", "") or "Target website rate limited: Too many signups. Cooling down..."
+                            update_batch(batch_id, error_message=batch_error_msg)
+                        if curr_rl >= 20:
+                            batch_error_msg = f"Target site rate limited repeatedly: {getattr(result, 'error', '') or 'Too many signups. Please try later.'}"
+                            circuit_event.set()
+                            return
                         if stop_event.wait(1.5):
                             return
                         continue

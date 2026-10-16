@@ -455,32 +455,46 @@ function App() {
                     </div>
                   </div>
 
-                  {batch.status === 'FAILED' && (
+                  {(batch.status === 'FAILED' || Boolean(batch.error_message)) && (
                     <div
                       style={{
                         background: batch.error_message?.toLowerCase().includes('limit')
                           ? 'rgba(245, 158, 11, 0.12)'
-                          : 'rgba(239, 68, 68, 0.12)',
+                          : batch.status === 'FAILED'
+                          ? 'rgba(239, 68, 68, 0.12)'
+                          : 'rgba(59, 130, 246, 0.12)',
                         border: batch.error_message?.toLowerCase().includes('limit')
                           ? '1px solid rgba(245, 158, 11, 0.4)'
-                          : '1px solid rgba(239, 68, 68, 0.4)',
+                          : batch.status === 'FAILED'
+                          ? '1px solid rgba(239, 68, 68, 0.4)'
+                          : '1px solid rgba(59, 130, 246, 0.4)',
                         padding: '12px 16px',
                         borderRadius: '12px',
                         marginBottom: '16px',
-                        color: batch.error_message?.toLowerCase().includes('limit') ? '#fcd34d' : '#fca5a5',
+                        color: batch.error_message?.toLowerCase().includes('limit')
+                          ? '#fcd34d'
+                          : batch.status === 'FAILED'
+                          ? '#fca5a5'
+                          : '#93c5fd',
                         fontSize: '0.875rem',
                       }}
                     >
                       <strong
                         style={{
                           display: 'block',
-                          color: batch.error_message?.toLowerCase().includes('limit') ? '#fbbf24' : '#f87171',
+                          color: batch.error_message?.toLowerCase().includes('limit')
+                            ? '#fbbf24'
+                            : batch.status === 'FAILED'
+                            ? '#f87171'
+                            : '#60a5fa',
                           marginBottom: '4px',
                         }}
                       >
-                        {batch.error_message?.toLowerCase().includes('limit')
-                          ? '🎯 Referral Code Limit Reached on Target Site:'
-                          : '⚠️ Task Halted:'}
+                        {batch.status === 'FAILED'
+                          ? batch.error_message?.toLowerCase().includes('limit')
+                            ? '🎯 Referral Code Limit Reached on Target Site:'
+                            : '⚠️ Task Halted:'
+                          : 'ℹ️ Live Status Update:'}
                       </strong>
                       {batch.error_message ||
                         'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}

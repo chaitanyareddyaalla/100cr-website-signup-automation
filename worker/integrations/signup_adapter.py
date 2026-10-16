@@ -7,12 +7,12 @@ from typing import Protocol
 try:
     from ..automation.browser_manager import BrowserManager
     from ..automation.device_manager import IsolatedDeviceTask
-    from ..generators.test_data import TestIdentity
+    from ..generators.test_data import TestIdentity, generate_random_name, generate_random_place
     from ..automation.signup_flow import SignupResult
 except ImportError:
     from worker.automation.browser_manager import BrowserManager
     from worker.automation.device_manager import IsolatedDeviceTask
-    from worker.generators.test_data import TestIdentity
+    from worker.generators.test_data import TestIdentity, generate_random_name, generate_random_place
     from worker.automation.signup_flow import SignupResult
 
 logger = logging.getLogger(__name__)
@@ -115,8 +115,8 @@ class AuthorizedPlaywrightAdapter:
         import urllib3
 
         safe_password = (identity.password or "").strip() or "SecurePass@123"
-        safe_name = (identity.name or "").strip() or os.getenv("DEFAULT_STATIC_NAME", "Sreedhar Reddy")
-        safe_place = (identity.place or "").strip() or os.getenv("DEFAULT_STATIC_PLACE", "Hyderabad")
+        safe_name = (identity.name or "").strip() or generate_random_name()
+        safe_place = (identity.place or "").strip() or generate_random_place()
         payload = json.dumps(
             {
                 "name": safe_name,
