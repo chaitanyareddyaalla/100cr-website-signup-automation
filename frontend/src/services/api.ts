@@ -39,37 +39,11 @@ export type WorkerInfo = {
   timestamp: string
 }
 
-export function getBaseUrl(): string {
-  try {
-    const override = localStorage.getItem('API_URL_OVERRIDE')
-    if (override && override.trim()) {
-      return override.trim().replace(/\/+$/, '')
-    }
-  } catch {}
-  const rawApiUrl = (import.meta.env.VITE_API_URL ?? import.meta.env.VITE_APP_URL ?? 'http://127.0.0.1:8000').trim()
-  return rawApiUrl.replace(/\/+$/, '')
-}
-
-export function setApiUrlOverride(url: string | null): void {
-  try {
-    if (url && url.trim()) {
-      localStorage.setItem('API_URL_OVERRIDE', url.trim())
-    } else {
-      localStorage.removeItem('API_URL_OVERRIDE')
-    }
-  } catch {}
-}
-
-export function getDefaultApiUrl(): string {
-  const rawApiUrl = (import.meta.env.VITE_API_URL ?? import.meta.env.VITE_APP_URL ?? 'http://127.0.0.1:8000').trim()
-  return rawApiUrl.replace(/\/+$/, '')
-}
-
-export const API_URL = getBaseUrl()
+const rawApiUrl = (import.meta.env.VITE_API_URL ?? import.meta.env.VITE_APP_URL ?? 'http://127.0.0.1:8000').trim()
+export const API_URL = rawApiUrl.replace(/\/+$/, '')
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const base = getBaseUrl()
-  const response = await fetch(`${base}${path}`, options)
+  const response = await fetch(`${API_URL}${path}`, options)
   if (!response.ok) throw new Error(`Request failed: ${response.status}`)
   return response.json() as Promise<T>
 }

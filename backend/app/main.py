@@ -1287,7 +1287,7 @@ def process_batch(batch_id: str) -> None:
                             batch_error_msg = getattr(result, "error", "") or "Target website rate limited: Too many signups. Cooling down..."
                             update_batch(batch_id, error_message=batch_error_msg)
                         if curr_rl >= 15:
-                            batch_error_msg = "Target website IP account limit reached on cloud server. Run on your local device (http://localhost:8000) or configure ROTATING_PROXY_URL."
+                            batch_error_msg = getattr(result, "error", "") or "Target website daily registration limit reached. Please try again later."
                             update_batch(batch_id, error_message=batch_error_msg)
                             limit_reached_event.set()
                             return

@@ -8,12 +8,10 @@ from typing import Protocol
 try:
     from ..automation.device_manager import IsolatedDeviceTask
     from ..generators.test_data import TestIdentity, generate_random_name, generate_random_place
-    from ..generators.phone_generator import generate_indian_ip
     from ..automation.signup_flow import SignupResult
 except ImportError:
     from worker.automation.device_manager import IsolatedDeviceTask
     from worker.generators.test_data import TestIdentity, generate_random_name, generate_random_place
-    from worker.generators.phone_generator import generate_indian_ip
     from worker.automation.signup_flow import SignupResult
 
 logger = logging.getLogger(__name__)
@@ -149,7 +147,6 @@ class AuthorizedPlaywrightAdapter:
         ).encode("utf-8")
 
         endpoint = self.base_url if "api" in self.base_url else f"{self.base_url}/api/auth/signup"
-        fake_ip = generate_indian_ip()
         headers = {
             "Content-Type": "application/json",
             "User-Agent": secrets.choice(_REALISTIC_USER_AGENTS),
@@ -157,8 +154,6 @@ class AuthorizedPlaywrightAdapter:
             "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.7",
             "Origin": "https://www.100crorescompany.com",
             "Referer": "https://www.100crorescompany.com/",
-            "X-Forwarded-For": fake_ip,
-            "X-Real-IP": fake_ip,
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",
