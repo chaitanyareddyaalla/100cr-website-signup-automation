@@ -1648,6 +1648,39 @@ def clear_system_memory() -> dict[str, object]:
     }
 
 
+@app.get("/system/debug-target")
+def debug_target(referral: str = "100CRCLUB4YU6P8ND") -> dict[str, object]:
+    """Diagnostic endpoint to inspect live target API response and server outbound IP."""
+    import urllib3
+    from worker.generators.phone_generator import generate_phone, generate_indian_ip
+    pool = urllib3.PoolManager(timeout=urllib3.Timeout(connect=5.0, read=10.0))
+    phone1 = generate_phone()
+    fake_ip = generate_indian_ip()
+    headers1 = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Origin": "https://www.100crorescompany.com",
+        "Referer": "https://www.100crorescompany.com/",
+        "X-Forwarded-For": fake_ip,
+        "X-Real-IP": fake_ip,
+    }
+    payload1 = json.dumps({"name": "Test User", "phone": phone1, "place": "Hyderabad", "password": "SecurePass@123", "referral_code": referral}).encode("utf-8")
+    resp1 = pool.request("POST", "https://api.universalcompanys.com/api/auth/signup", body=payload1, headers=headers1)
+
+    try:
+        my_ip = pool.request("GET", "https://api.ipify.org").data.decode("utf-8")
+    except Exception as e:
+        my_ip = str(e)
+
+    return {
+        "server_public_ip": my_ip,
+        "test_phone": phone1,
+        "test_ip": fake_ip,
+        "target_status": resp1.status,
+        "target_body": resp1.data.decode("utf-8", errors="replace"),
+    }
+
+
 @app.post("/referrals", dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
 def create_referral(data: ReferralRequest) -> dict[str, object]:
     batch = create_batch(data.referral)
