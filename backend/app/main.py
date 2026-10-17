@@ -1279,15 +1279,21 @@ def process_batch(batch_id: str) -> None:
                     if result.status == "RATE_LIMITED":
                         logger.warning("Batch %s: target site rate limited; cooling down 1.5s", batch_id)
                         rate_limit_until = time.monotonic() + 1.5
+                        increment_batch_counters(batch_id, skipped=1, attempted=1)
                         with fail_lock:
                             consecutive_rate_limits += 1
                             curr_rl = consecutive_rate_limits
                         if curr_rl >= 3:
                             batch_error_msg = getattr(result, "error", "") or "Target website rate limited: Too many signups. Cooling down..."
                             update_batch(batch_id, error_message=batch_error_msg)
+                        if curr_rl >= 15:
+                            batch_error_msg = "Target website IP account limit reached on cloud server. Run on your local device (http://localhost:8000) or configure ROTATING_PROXY_URL."
+                            update_batch(batch_id, error_message=batch_error_msg)
+                            limit_reached_event.set()
+                            return
                         if stop_event.wait(1.5):
                             return
-                        continue
+                        return
                     if result.status == "SERVER_ERROR":
                         logger.warning("Batch %s: target site temporary server/5xx error; cooling down 0.25s", batch_id)
                         time.sleep(0.25)

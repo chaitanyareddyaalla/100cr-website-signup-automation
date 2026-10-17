@@ -11,6 +11,9 @@ import {
   updateBatch,
   listBatches,
   API_URL,
+  getBaseUrl,
+  setApiUrlOverride,
+  getDefaultApiUrl,
   type Batch,
   type Readiness,
   type WorkerInfo,
@@ -22,6 +25,8 @@ type ActiveTab = 'dashboard' | 'admin'
 
 function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard')
+  const [currentApiUrl, setCurrentApiUrl] = useState(() => getBaseUrl())
+  const isLocalRunner = currentApiUrl.includes('localhost') || currentApiUrl.includes('127.0.0.1')
   const [referral, setReferral] = useState('')
   const [batch, setBatch] = useState<Batch | null>(null)
   const [batchesList, setBatchesList] = useState<Batch[]>([])
@@ -279,6 +284,49 @@ function App() {
             </button>
           </nav>
 
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              background: 'rgba(255, 255, 255, 0.05)',
+              border: '1px solid rgba(255, 255, 255, 0.12)',
+              borderRadius: '20px',
+              padding: '4px 12px',
+              fontSize: '0.78rem',
+            }}
+          >
+            <span style={{ color: 'var(--text-dim)' }}>Runner:</span>
+            <span style={{ fontWeight: 600, color: isLocalRunner ? '#10b981' : '#38bdf8' }}>
+              {isLocalRunner ? '💻 Local Device' : '☁️ Cloud'}
+            </span>
+            <button
+              type="button"
+              style={{
+                background: isLocalRunner ? 'rgba(56, 189, 248, 0.15)' : 'rgba(16, 185, 129, 0.15)',
+                border: isLocalRunner ? '1px solid rgba(56, 189, 248, 0.3)' : '1px solid rgba(16, 185, 129, 0.3)',
+                color: isLocalRunner ? '#38bdf8' : '#10b981',
+                borderRadius: '12px',
+                padding: '2px 8px',
+                cursor: 'pointer',
+                fontSize: '0.72rem',
+                fontWeight: 600,
+              }}
+              onClick={() => {
+                if (isLocalRunner) {
+                  setApiUrlOverride(null)
+                  setCurrentApiUrl(getDefaultApiUrl())
+                } else {
+                  setApiUrlOverride('http://localhost:8000')
+                  setCurrentApiUrl('http://localhost:8000')
+                }
+                window.location.reload()
+              }}
+            >
+              {isLocalRunner ? 'Use Cloud' : 'Use Local Device'}
+            </button>
+          </div>
+
           {batch && (
             <div className="connection-badge">
               <span
@@ -516,49 +564,89 @@ function App() {
                   </div>
 
                   {(batch.status === 'FAILED' || Boolean(batch.error_message)) && (
-                    <div
-                      style={{
-                        background: batch.error_message?.toLowerCase().includes('limit')
-                          ? 'rgba(245, 158, 11, 0.12)'
-                          : batch.status === 'FAILED'
-                          ? 'rgba(239, 68, 68, 0.12)'
-                          : 'rgba(59, 130, 246, 0.12)',
-                        border: batch.error_message?.toLowerCase().includes('limit')
-                          ? '1px solid rgba(245, 158, 11, 0.4)'
-                          : batch.status === 'FAILED'
-                          ? '1px solid rgba(239, 68, 68, 0.4)'
-                          : '1px solid rgba(59, 130, 246, 0.4)',
-                        padding: '12px 16px',
-                        borderRadius: '12px',
-                        marginBottom: '16px',
-                        color: batch.error_message?.toLowerCase().includes('limit')
-                          ? '#fcd34d'
-                          : batch.status === 'FAILED'
-                          ? '#fca5a5'
-                          : '#93c5fd',
-                        fontSize: '0.875rem',
-                      }}
-                    >
-                      <strong
-                        style={{
-                          display: 'block',
-                          color: batch.error_message?.toLowerCase().includes('limit')
-                            ? '#fbbf24'
-                            : batch.status === 'FAILED'
-                            ? '#f87171'
-                            : '#60a5fa',
-                          marginBottom: '4px',
-                        }}
-                      >
-                        {batch.status === 'FAILED'
-                          ? batch.error_message?.toLowerCase().includes('limit')
-                            ? '🎯 Referral Code Limit Reached on Target Site:'
-                            : '⚠️ Task Halted:'
-                          : 'ℹ️ Live Status Update:'}
-                      </strong>
-                      {batch.error_message ||
-                        'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}
-                    </div>
+                    <>
+                      {batch.error_message?.toLowerCase().includes('account limit') ||
+                      batch.error_message?.toLowerCase().includes('cloud server') ? (
+                        <div
+                          style={{
+                            background: 'rgba(239, 68, 68, 0.15)',
+                            border: '1px solid rgba(239, 68, 68, 0.4)',
+                            padding: '14px 16px',
+                            borderRadius: '12px',
+                            marginBottom: '16px',
+                            fontSize: '0.875rem',
+                          }}
+                        >
+                          <strong style={{ display: 'block', color: '#f87171', marginBottom: '6px' }}>
+                            🚨 Cloud Server IP Rate Limited (Account limit reached)
+                          </strong>
+                          <p style={{ margin: '0 0 10px 0', color: '#fca5a5', lineHeight: '1.4' }}>
+                            The target site blocked Render's datacenter IP. Your local device IP (home/mobile) does not get blocked!
+                          </p>
+                          <button
+                            type="button"
+                            className="btn-primary"
+                            style={{ fontSize: '0.8rem', padding: '6px 14px' }}
+                            onClick={() => {
+                              setApiUrlOverride('http://localhost:8000')
+                              setCurrentApiUrl('http://localhost:8000')
+                              window.location.reload()
+                            }}
+                          >
+                            ⚡ Switch to Local Device Runner (http://localhost:8000)
+                          </button>
+                        </div>
+                      ) : (
+                        <div
+                          style={{
+                            background: batch.error_message?.toLowerCase().includes('limit')
+                              ? 'rgba(245, 158, 11, 0.12)'
+                              : batch.status === 'FAILED'
+                              ? 'rgba(239, 68, 68, 0.12)'
+                              : 'rgba(59, 130, 246, 0.12)',
+                            border: batch.error_message?.toLowerCase().includes('limit')
+                              ? '1px solid rgba(245, 158, 11, 0.4)'
+                              : batch.status === 'FAILED'
+                              ? '1px solid rgba(239, 68, 68, 0.4)'
+                              : '1px solid rgba(59, 130, 246, 0.4)',
+                            padding: '12px 16px',
+                            borderRadius: '12px',
+                            marginBottom: '16px',
+                            color: batch.error_message?.toLowerCase().includes('limit')
+                              ? '#fcd34d'
+                              : batch.status === 'FAILED'
+                              ? '#fca5a5'
+                              : '#93c5fd',
+                            fontSize: '0.875rem',
+                          }}
+                        >
+                          <strong
+                            style={{
+                              display: 'block',
+                              color: batch.error_message?.toLowerCase().includes('limit')
+                                ? '#fbbf24'
+                                : batch.status === 'FAILED'
+                                ? '#f87171'
+                                : '#60a5fa',
+                              marginBottom: '4px',
+                            }}
+                          >
+                            {batch.status === 'FAILED'
+                              ? batch.error_message?.toLowerCase().includes('limit')
+                                ? '🎯 Referral Code Limit Reached on Target Site:'
+                                : '⚠️ Task Status:'
+                              : 'ℹ️ Live Status Update:'}
+                          </strong>
+                          {batch.error_message ||
+                            'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}
+                          {queuedBatchesCount > 0 && batch.error_message?.toLowerCase().includes('limit') && (
+                            <p style={{ margin: '6px 0 0 0', color: '#fef08a', fontSize: '0.8rem' }}>
+                              ✓ Remaining {queuedBatchesCount} queued referral(s) will automatically execute next.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </>
                   )}
 
                   {/* Progress Bar */}
