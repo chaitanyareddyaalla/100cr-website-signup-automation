@@ -61,6 +61,14 @@ export function createBatch(referral: string, autoStart = true) {
   })
 }
 
+export function createBatchesBulk(referrals: string[], autoStart = true) {
+  return request<Batch[]>('/batches/bulk', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ referrals, auto_start: autoStart }),
+  })
+}
+
 export function getBatch(id: string) {
   return request<Batch>(`/batches/${id}`)
 }

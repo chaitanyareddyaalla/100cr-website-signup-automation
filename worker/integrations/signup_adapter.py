@@ -150,7 +150,7 @@ class AuthorizedPlaywrightAdapter:
             "Connection": "keep-alive",
         }
 
-        max_attempts = 3
+        max_attempts = int(os.getenv("MAX_SIGNUP_ATTEMPTS", "1"))
         last_body = ""
         last_status = 0
         pool = _http_pool()

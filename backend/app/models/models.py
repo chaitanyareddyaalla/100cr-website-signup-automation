@@ -46,7 +46,14 @@ class JobStatus(str, Enum):
 
 class ReferralRequest(BaseModel):
     """Request model for creating a batch."""
-    referral: str = Field(min_length=1, max_length=120)
+    referral: str = Field(min_length=1, max_length=5000)
+    auto_start: bool = False
+
+
+class BulkReferralRequest(BaseModel):
+    """Request model for creating multiple batches at once."""
+    referrals: list[str] = Field(min_length=1)
+    auto_start: bool = True
 
 
 class BatchResponse(BaseModel):

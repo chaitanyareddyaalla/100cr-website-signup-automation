@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   createBatch,
+  createBatchesBulk,
   getBatch,
   getHealth,
   getReadiness,
@@ -27,6 +28,7 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [operation, setOperation] = useState<'start' | 'pause' | 'resume' | 'stop' | null>(null)
   const [error, setError] = useState('')
+  const [successMsg, setSuccessMsg] = useState('')
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
 
   // Admin Data
@@ -68,6 +70,10 @@ function App() {
             }
             if (prev) {
               const updated = list.find((b) => b.id === prev.id)
+              if (updated && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(updated.status)) {
+                const nextActive = list.find((b) => b.status === 'RUNNING' || b.status === 'QUEUED')
+                if (nextActive) return nextActive
+              }
               return updated || prev
             }
             return prev
@@ -168,16 +174,37 @@ function App() {
   }, [batch?.id])
 
   async function handleCreateBatch() {
-    const code = referral.trim()
-    if (!code) {
-      setError('Please enter a referral code first.')
+    const raw = referral.trim()
+    if (!raw) {
+      setError('Please enter at least one referral code.')
       return
     }
+    const codes = raw
+      .split(/[\r\n,;\s]+/)
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0)
+
+    if (codes.length === 0) {
+      setError('Please enter a valid referral code.')
+      return
+    }
+
     setError('')
+    setSuccessMsg('')
     setLoading(true)
     try {
-      const created = await createBatch(code, true)
-      setBatch(created)
+      if (codes.length === 1) {
+        const created = await createBatch(codes[0], true)
+        setBatch(created)
+        setSuccessMsg(`Task started for ${codes[0]} (Target: 1,000)`)
+      } else {
+        const createdList = await createBatchesBulk(codes, true)
+        if (createdList && createdList.length > 0) {
+          setBatch(createdList[0])
+        }
+        setSuccessMsg(`Queued ${codes.length} referrals on device: 1 running, ${codes.length - 1} waiting in queue (1,000 target each).`)
+      }
+      setReferral('')
       const list = await listBatches(30)
       setBatchesList(list)
     } catch {
@@ -408,21 +435,53 @@ function App() {
             </div>
           </div>
 
+          {queuedBatchesCount > 0 && (
+            <div
+              style={{
+                marginBottom: '18px',
+                padding: '12px 18px',
+                borderRadius: '10px',
+                background: 'rgba(56, 189, 248, 0.1)',
+                border: '1px solid rgba(56, 189, 248, 0.25)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                fontSize: '0.85rem',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span style={{ fontSize: '1.2rem' }}>🔄</span>
+                <span>
+                  <strong>Sequential Device Queue:</strong> {runningBatchesCount > 0 ? '1 referral running' : 'Idle'} &bull;{' '}
+                  <span style={{ color: '#38bdf8', fontWeight: 600 }}>{queuedBatchesCount} waiting in queue</span>.
+                  Remaining referrals will execute sequentially without delay.
+                </span>
+              </div>
+            </div>
+          )}
+
           <div className="dashboard-grid">
             {/* Create Batch Card */}
             <div className="card">
-              <p className="card-label">01 / NEW BATCH</p>
+              <p className="card-label">01 / NEW REFERRALS QUEUE</p>
               <div className="form-group">
-                <label htmlFor="referral-input">Referral Code</label>
+                <label htmlFor="referral-input" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>Referral Code(s)</span>
+                  <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>1 at a time, rest stay in queue</span>
+                </label>
                 <div className="input-row">
-                  <input
+                  <textarea
                     id="referral-input"
                     className="input-field"
+                    rows={3}
                     value={referral}
                     onChange={(e) => setReferral(e.target.value)}
-                    placeholder="e.g. 100CRCLUBW9PKQ69N"
-                    maxLength={100}
+                    placeholder="Enter referral code(s) — paste one or multiple (one per line or comma-separated):&#10;100CRCLUBW9PKQ69N&#10;100CRCLUBBOSUU11G"
+                    style={{ resize: 'vertical', minHeight: '68px', fontFamily: 'monospace', fontSize: '0.88rem' }}
                   />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px', fontSize: '0.75rem', color: '#64748b' }}>
+                  <span>⚡ Single device sequential runner: 0 retries, immediate fresh phones, fast 1,000 targets.</span>
                 </div>
               </div>
 
@@ -433,9 +492,10 @@ function App() {
                 onClick={handleCreateBatch}
                 disabled={loading}
               >
-                {loading ? 'Launching Task...' : 'Launch Task'}
+                {loading ? 'Queueing Referrals...' : 'Launch / Queue Referrals'}
               </button>
 
+              {successMsg && <p style={{ color: '#10b981', fontSize: '0.85rem', marginTop: '10px' }}>✓ {successMsg}</p>}
               {error && <p className="error-msg" style={{ marginTop: '12px' }}>{error}</p>}
             </div>
 

@@ -890,3 +890,41 @@ def test_partial_batch_on_limit_not_marked_completed(monkeypatch) -> None:
     assert "limit" in result["error_message"].lower()
 
 
+def test_zero_retries_policy() -> None:
+    assert backend_main.should_retry("FAILURE", "RUNNING", 0) is False
+    assert backend_main.should_retry("TIMEOUT", "RUNNING", 0) is False
+
+
+def test_multi_referral_batch_creation_queues_all() -> None:
+    referrals_text = "REF100CR1\nREF100CR2\nREF100CR3"
+    with TestClient(app) as client:
+        response = client.post(
+            "/batches?auto_start=true",
+            json={"referral": referrals_text, "auto_start": True},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["referral"] == "REF100CR1"
+
+        all_batches = client.get("/batches?limit=10").json()
+        refs = [b["referral"] for b in all_batches]
+        assert "REF100CR1" in refs
+        assert "REF100CR2" in refs
+        assert "REF100CR3" in refs
+
+
+def test_bulk_batches_endpoint() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/batches/bulk",
+            json={"referrals": ["BULKREF_A", "BULKREF_B"], "auto_start": True},
+        )
+        assert response.status_code == 200
+        batches = response.json()
+        assert len(batches) == 2
+        assert batches[0]["referral"] == "BULKREF_A"
+        assert batches[1]["referral"] == "BULKREF_B"
+        assert batches[0]["target"] == 1000
+        assert batches[1]["target"] == 1000
+
+

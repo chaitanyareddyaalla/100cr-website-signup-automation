@@ -1,12 +1,14 @@
 """Batch management API endpoints."""
 
 import logging
-from fastapi import APIRouter
-from backend.app.models.models import BatchResponse, ReferralRequest, BatchStatus
+import re
+from fastapi import APIRouter, HTTPException
+from backend.app.models.models import BatchResponse, ReferralRequest, BulkReferralRequest, BatchStatus
 from backend.app.main import (
     get_batch, create_batch, update_batch, transition_batch,
     create_job, job_queue,
-    pause_events, stop_events
+    pause_events, stop_events,
+    now
 )
 
 router = APIRouter(prefix="/batches", tags=["batches"])
@@ -14,10 +16,36 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=BatchResponse)
-def post_batch(data: ReferralRequest) -> dict:
-    """Create a new batch."""
-    logger.info(f"Creating batch for referral: {data.referral}")
-    return create_batch(data.referral)
+def post_batch(data: ReferralRequest, auto_start: bool = False) -> dict:
+    """Create a new batch, or multiple sequential queued batches if multiple codes are provided."""
+    raw = data.referral.strip()
+    codes = [c.strip() for c in re.split(r"[\r\n,;]+", raw) if c.strip()]
+    if not codes:
+        raise HTTPException(status_code=400, detail="Referral code cannot be empty")
+    logger.info(f"Creating batch for primary referral: {codes[0]}")
+    first_batch = create_batch(codes[0])
+    should_start = auto_start or getattr(data, "auto_start", False)
+    if should_start:
+        first_batch = start_batch(first_batch["id"])
+    for extra in codes[1:]:
+        extra_b = create_batch(extra)
+        if should_start:
+            start_batch(extra_b["id"])
+    return first_batch
+
+
+@router.post("/bulk", response_model=list[BatchResponse])
+def post_batches_bulk(data: BulkReferralRequest) -> list[dict]:
+    """Create multiple sequential batches, queueing remaining tasks to run in order."""
+    created = []
+    for ref in data.referrals:
+        cleaned = ref.strip()
+        if cleaned:
+            b = create_batch(cleaned)
+            if data.auto_start:
+                b = start_batch(b["id"])
+            created.append(b)
+    return created
 
 
 @router.get("/{batch_id}", response_model=BatchResponse)
@@ -31,7 +59,7 @@ def start_batch(batch_id: str) -> dict:
     """Start a batch."""
     logger.info(f"Starting batch {batch_id}")
     transition_batch(batch_id, BatchStatus.QUEUED.value, "Only CREATED batches can be started")
-    update_batch(batch_id, started_at=None)  # TODO: Use proper timestamp
+    update_batch(batch_id, started_at=now())
     pause_events.setdefault(batch_id, __import__('threading').Event()).clear()
     stop_events.setdefault(batch_id, __import__('threading').Event()).clear()
     create_job(batch_id)

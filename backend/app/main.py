@@ -31,6 +31,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -110,8 +111,13 @@ ALLOWED_STATE_TRANSITIONS: dict[str, set[str]] = {
 
 
 class ReferralRequest(BaseModel):
-    referral: str = Field(min_length=1, max_length=120)
+    referral: str = Field(min_length=1, max_length=5000)
     auto_start: bool = False
+
+
+class BulkReferralRequest(BaseModel):
+    referrals: list[str] = Field(min_length=1)
+    auto_start: bool = True
 
 
 class BatchResponse(BaseModel):
@@ -641,7 +647,7 @@ def calculate_retry_delay(attempt: int) -> float:
 
 
 def should_retry(status: str, batch_status: str | None, retry_count: int) -> bool:
-    if not status:
+    if not status or MAX_SIGNUP_RETRIES <= 0:
         return False
     if batch_status in {BatchStatus.CANCELLED.value, BatchStatus.COMPLETED.value, BatchStatus.FAILED.value}:
         return False
@@ -1279,10 +1285,6 @@ def process_batch(batch_id: str) -> None:
                         if curr_rl >= 3:
                             batch_error_msg = getattr(result, "error", "") or "Target website rate limited: Too many signups. Cooling down..."
                             update_batch(batch_id, error_message=batch_error_msg)
-                        if curr_rl >= 20:
-                            batch_error_msg = f"Target site rate limited repeatedly: {getattr(result, 'error', '') or 'Too many signups. Please try later.'}"
-                            circuit_event.set()
-                            return
                         if stop_event.wait(1.5):
                             return
                         continue
@@ -1686,10 +1688,32 @@ def list_batches(limit: int = 50, status: str | None = None) -> list[dict]:
 
 @app.post("/batches", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
 def post_batch(data: ReferralRequest, auto_start: bool = False) -> dict:
-    batch = create_batch(data.referral)
-    if auto_start or getattr(data, "auto_start", False):
-        return start_batch(batch["id"])
-    return batch
+    raw = data.referral.strip()
+    codes = [c.strip() for c in re.split(r"[\r\n,;]+", raw) if c.strip()]
+    if not codes:
+        raise HTTPException(status_code=400, detail="Referral code cannot be empty")
+    first_batch = create_batch(codes[0])
+    should_start = auto_start or getattr(data, "auto_start", False)
+    if should_start:
+        first_batch = start_batch(first_batch["id"])
+    for extra in codes[1:]:
+        extra_b = create_batch(extra)
+        if should_start:
+            start_batch(extra_b["id"])
+    return first_batch
+
+
+@app.post("/batches/bulk", response_model=list[BatchResponse], dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR))])
+def post_batches_bulk(data: BulkReferralRequest) -> list[dict]:
+    created = []
+    for ref in data.referrals:
+        cleaned = ref.strip()
+        if cleaned:
+            b = create_batch(cleaned)
+            if data.auto_start:
+                b = start_batch(b["id"])
+            created.append(b)
+    return created
 
 
 @app.get("/batches/{batch_id}", response_model=BatchResponse, dependencies=[Depends(require_role(Role.ADMIN, Role.OPERATOR, Role.VIEWER))])
