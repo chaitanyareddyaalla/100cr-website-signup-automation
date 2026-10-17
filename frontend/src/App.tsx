@@ -551,13 +551,15 @@ function App() {
                         }}
                       >
                         {batch.status === 'FAILED'
-                          ? batch.error_message?.toLowerCase().includes('limit')
+                          ? batch.error_message?.toLowerCase().includes('referral')
                             ? '🎯 Referral Code Limit Reached on Target Site:'
+                            : batch.error_message?.toLowerCase().includes('account limit')
+                            ? '⚠️ Target Site Daily IP Limit Reached:'
                             : '⚠️ Task Status:'
                           : 'ℹ️ Live Status Update:'}
                       </strong>
                       {batch.error_message ||
-                        'This referral code has reached its maximum limit on the target site or signups were rejected. Please use a fresh referral code.'}
+                        'Signups could not be completed on target site. Please check details or try again.'}
                       {queuedBatchesCount > 0 && (
                         <p style={{ margin: '6px 0 0 0', color: '#fef08a', fontSize: '0.8rem' }}>
                           ✓ Remaining {queuedBatchesCount} queued referral(s) will automatically execute next.
