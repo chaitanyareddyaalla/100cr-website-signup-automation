@@ -1,10 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-try:
-    from ..generators.test_data import TestIdentity
-except ImportError:
-    from worker.generators.test_data import TestIdentity
 
 
 @dataclass(frozen=True)

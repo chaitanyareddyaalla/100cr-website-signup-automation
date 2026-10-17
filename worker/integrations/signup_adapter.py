@@ -5,12 +5,10 @@ import threading
 from typing import Protocol
 
 try:
-    from ..automation.browser_manager import BrowserManager
     from ..automation.device_manager import IsolatedDeviceTask
     from ..generators.test_data import TestIdentity, generate_random_name, generate_random_place
     from ..automation.signup_flow import SignupResult
 except ImportError:
-    from worker.automation.browser_manager import BrowserManager
     from worker.automation.device_manager import IsolatedDeviceTask
     from worker.generators.test_data import TestIdentity, generate_random_name, generate_random_place
     from worker.automation.signup_flow import SignupResult
@@ -34,11 +32,22 @@ _DUPLICATE_MARKERS = (
     "duplicate entry",
     "duplicate phone",
 )
-_LIMIT_MARKERS = (
-    "maximum limit",
-    "reached its maximum",
+_REFERRAL_LIMIT_MARKERS = (
     "referral code has reached",
-    "limit reached",
+    "referral code maximum",
+    "referral limit reached",
+    "referral code limit reached",
+    "reached its maximum referral",
+    "maximum limit for this referral",
+    "reached its maximum limit",
+)
+_IP_LIMIT_MARKERS = (
+    "account limit reached",
+    "try again tomorrow",
+    "daily limit",
+    "too many accounts",
+    "registration limit reached",
+    "limit reached. try again",
 )
 _INVALID_REFERRAL_MARKERS = (
     "invalid referral",
@@ -171,7 +180,15 @@ class AuthorizedPlaywrightAdapter:
                         return SignupResult.success(identity.account_id, phone=identity.phone)
                     return SignupResult.duplicate(identity.account_id, phone=identity.phone)
 
-                if any(marker in body_lower for marker in _LIMIT_MARKERS):
+                if any(marker in body_lower for marker in _IP_LIMIT_MARKERS):
+                    return SignupResult(
+                        account_id=identity.account_id,
+                        status="RATE_LIMITED",
+                        error=self._extract_clean_msg(last_body) or "Target site IP account limit reached. Try again tomorrow or use rotating proxy.",
+                        phone=identity.phone,
+                    )
+
+                if any(marker in body_lower for marker in _REFERRAL_LIMIT_MARKERS):
                     return SignupResult.limit_reached(
                         identity.account_id,
                         error=self._extract_clean_msg(last_body) or "Referral code maximum limit reached",
@@ -227,16 +244,22 @@ class AuthorizedPlaywrightAdapter:
                 error=clean_msg or f"Server error {http_status}",
                 phone=identity.phone,
             )
-        if http_status == 429 or "too many signups" in body_lower or "too many requests" in body_lower or "rate limit" in body_lower:
+        if (
+            http_status == 429
+            or any(marker in body_lower for marker in _IP_LIMIT_MARKERS)
+            or "too many signups" in body_lower
+            or "too many requests" in body_lower
+            or "rate limit" in body_lower
+        ):
             return SignupResult(
                 account_id=identity.account_id,
                 status="RATE_LIMITED",
-                error=clean_msg or "Rate limited (HTTP 429)",
+                error=clean_msg or "Target site rate limited (HTTP 429 / Account limit reached)",
                 phone=identity.phone,
             )
         if http_status == 409 or any(marker in body_lower for marker in _DUPLICATE_MARKERS):
             return SignupResult.duplicate(identity.account_id, phone=identity.phone)
-        if any(marker in body_lower for marker in _LIMIT_MARKERS):
+        if any(marker in body_lower for marker in _REFERRAL_LIMIT_MARKERS):
             return SignupResult.limit_reached(
                 identity.account_id,
                 error=clean_msg or "Referral code maximum limit reached",

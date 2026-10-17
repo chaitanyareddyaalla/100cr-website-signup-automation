@@ -50,16 +50,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from worker.generators.test_data import (
     TestIdentity,
-    DEFAULT_STATIC_NAME,
     DEFAULT_STATIC_PASSWORD,
-    DEFAULT_STATIC_PLACE,
     DEFAULT_STATIC_LANGUAGE,
     generate_random_name,
     generate_random_place,
 )
 from worker.generators.phone_generator import generate_phone
 from backend.app.api.auth import Role, require_role
-from backend.app.config import automation_mode, validate_automation_configuration
+from backend.app.config import validate_automation_configuration
 from worker.integrations.signup_adapter import AuthorizedPlaywrightAdapter
 
 # Configure logging
@@ -1408,12 +1406,12 @@ def process_batch(batch_id: str) -> None:
             return
         if limit_reached_event.is_set() or circuit_event.is_set():
             if limit_reached_event.is_set():
-                # Referral code achieved maximum allowed count on target site; mark completed if signups > 0
-                final_status = BatchStatus.COMPLETED.value if batch["successful"] > 0 else BatchStatus.FAILED.value
+                # Referral code achieved maximum allowed count on target site; mark completed only if target reached
+                final_status = BatchStatus.COMPLETED.value if batch["successful"] >= batch["target"] else BatchStatus.FAILED.value
                 err_msg = batch_error_msg or f"Referral code maximum limit reached on target site ({batch['successful']}/{batch['target']} signups completed)"
             else:
                 final_status = BatchStatus.FAILED.value
-                err_msg = f"Halted after {max_consecutive_failures} consecutive failures on target site"
+                err_msg = batch_error_msg or f"Halted after {max_consecutive_failures} consecutive failures on target site"
             update_batch(batch_id, status=final_status, completed_at=now(), error_message=err_msg)
             acknowledge_job(job_id, final_status)
             return

@@ -846,3 +846,47 @@ def test_system_memory_endpoints() -> None:
         assert "freed_mb" in clear_data
         assert "purged_temp_files" in clear_data
 
+
+def test_account_limit_reached_classified_as_rate_limited() -> None:
+    from worker.generators.test_data import TestIdentity
+    from worker.integrations.signup_adapter import AuthorizedPlaywrightAdapter
+
+    adapter = AuthorizedPlaywrightAdapter()
+    identity = TestIdentity(
+        account_id="test-1",
+        name="Test",
+        phone="9876543210",
+        referral="100CRCLUB2MT6542B",
+        test_id="t-1",
+    )
+    result = adapter._classify_error_body(
+        identity,
+        '{"message": "Account limit reached. Try again tomorrow."}',
+        http_status=400,
+    )
+    assert result.status == "RATE_LIMITED"
+    assert "account limit reached" in result.error.lower()
+
+
+def test_partial_batch_on_limit_not_marked_completed(monkeypatch) -> None:
+    from worker.automation.signup_flow import SignupResult
+
+    count = 0
+
+    def mock_signup(identity):
+        nonlocal count
+        count += 1
+        if count == 1:
+            return SignupResult.success(identity.account_id, phone=identity.phone)
+        return SignupResult.limit_reached(identity.account_id, "Referral code maximum limit reached")
+
+    monkeypatch.setattr(backend_main, "run_mock_signup", mock_signup)
+    batch = queued_batch(10)
+    backend_main.process_batch(batch["id"])
+    result = backend_main.get_batch(batch["id"])
+    # Partial batch must be marked FAILED with limit reason, not falsely marked COMPLETED
+    assert result["status"] == "FAILED"
+    assert result["successful"] == 1
+    assert "limit" in result["error_message"].lower()
+
+

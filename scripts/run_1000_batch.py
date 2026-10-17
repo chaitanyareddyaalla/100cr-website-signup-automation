@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import sqlite3
 
 # Force live automation mode
 os.environ["AUTOMATION_MODE"] = "live"
