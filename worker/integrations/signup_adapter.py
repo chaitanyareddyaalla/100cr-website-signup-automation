@@ -2,15 +2,18 @@ import json
 import logging
 import os
 import threading
+import secrets
 from typing import Protocol
 
 try:
     from ..automation.device_manager import IsolatedDeviceTask
     from ..generators.test_data import TestIdentity, generate_random_name, generate_random_place
+    from ..generators.phone_generator import generate_indian_ip
     from ..automation.signup_flow import SignupResult
 except ImportError:
     from worker.automation.device_manager import IsolatedDeviceTask
     from worker.generators.test_data import TestIdentity, generate_random_name, generate_random_place
+    from worker.generators.phone_generator import generate_indian_ip
     from worker.automation.signup_flow import SignupResult
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,15 @@ _INVALID_REFERRAL_MARKERS = (
     "referral code not found",
     "referral not found",
     "invalid code",
+)
+_REALISTIC_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
 
 
@@ -137,13 +149,16 @@ class AuthorizedPlaywrightAdapter:
         ).encode("utf-8")
 
         endpoint = self.base_url if "api" in self.base_url else f"{self.base_url}/api/auth/signup"
+        fake_ip = generate_indian_ip()
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": secrets.choice(_REALISTIC_USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.7",
             "Origin": "https://www.100crorescompany.com",
             "Referer": "https://www.100crorescompany.com/",
+            "X-Forwarded-For": fake_ip,
+            "X-Real-IP": fake_ip,
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",

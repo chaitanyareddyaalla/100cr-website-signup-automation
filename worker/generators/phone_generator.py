@@ -36,3 +36,18 @@ def generate_phone(index: int = 0) -> str:
             return f"{prefix}{suffix}"
     prefix = secrets.choice(VALID_INDIAN_PREFIXES)
     return f"{prefix}{secrets.randbelow(100_000_000):08d}"
+
+
+# Authentic Indian ISP residential IP prefixes (Jio, Airtel, BSNL, ACT Fibernet, Vodafone-Idea)
+INDIAN_ISP_SUBNETS = (
+    "49.36.", "49.37.", "106.51.", "157.48.", "157.49.",
+    "122.161.", "122.162.", "27.56.", "27.57.", "14.139.",
+    "182.72.", "182.73.", "103.212.", "117.211.",
+)
+
+
+def generate_indian_ip() -> str:
+    """Generate a high-entropy, realistic Indian residential IP address."""
+    subnet = secrets.choice(INDIAN_ISP_SUBNETS)
+    return f"{subnet}{secrets.randbelow(250) + 1}.{secrets.randbelow(250) + 1}"
+

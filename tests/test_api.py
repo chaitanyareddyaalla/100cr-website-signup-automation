@@ -20,6 +20,7 @@ def isolate_worker_state(tmp_path, monkeypatch):
     monkeypatch.setenv("MAX_CONSECUTIVE_FAILURES", "20")
     monkeypatch.setattr(backend_main, "DATABASE_PATH", tmp_path / "batches.db")
     monkeypatch.setattr(backend_main, "RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(backend_main, "DISPATCH_PACING_SECONDS", 0.0)
     monkeypatch.setattr(backend_main, "_signup_in_flight", 0)
     backend_main.pause_events.clear()
     backend_main.stop_events.clear()
